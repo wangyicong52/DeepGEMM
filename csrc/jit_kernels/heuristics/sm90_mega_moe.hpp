@@ -272,6 +272,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
+    const int& num_sms_override = 0,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
     const bool& use_swap_ab = false,
@@ -308,7 +309,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 0;
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = num_sms_override ? num_sms_override : device_runtime->get_num_sms();
     int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,

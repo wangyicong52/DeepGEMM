@@ -320,7 +320,8 @@ static void fp8_fp4_mega_moe_sm90(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const int& num_sms_override = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -378,6 +379,11 @@ static void fp8_fp4_mega_moe_sm90(
 
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
+    if (num_sms_override) {
+        DG_HOST_ASSERT(num_sms_override > 1);
+        DG_HOST_ASSERT(num_sms_override <= device_runtime->get_prop()->multiProcessorCount);
+        DG_HOST_ASSERT(num_sms_override % 2 == 0);
+    }
 
     const auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk, intermediate_hidden);
@@ -402,7 +408,8 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.l2_arrival_counter,
                           fp4_defaults.ss_nsplit,
                           fp4_defaults.swap_ab,
-                          fp4_defaults.swap_ab_fast_amax);
+                          fp4_defaults.swap_ab_fast_amax,
+                          num_sms_override);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

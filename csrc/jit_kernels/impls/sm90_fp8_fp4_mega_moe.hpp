@@ -202,11 +202,13 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_l2_arrival_counter = false,
     const bool& use_ss_nsplit = false,
     const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false
+    const bool& use_swap_ab_fast_amax = false,
+    const int& num_sms_override = 0
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const int effective_num_sms = num_sms_override ? num_sms_override : device_runtime->get_num_sms();
 
     // Sanity: SFB tensors must be uint32 (UE8M0 packed) and weight tensors
     // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
@@ -215,12 +217,16 @@ static void sm90_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);
     DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
     DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
+    DG_HOST_ASSERT(effective_num_sms > 1);
+    DG_HOST_ASSERT(effective_num_sms <= device_runtime->get_prop()->multiProcessorCount);
+    DG_HOST_ASSERT(effective_num_sms % 2 == 0);
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90_fp4(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+        effective_num_sms,
         use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab, use_swap_ab_fast_amax);
 
@@ -306,7 +312,6 @@ static void sm90_fp8_fp4_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
     const SM90FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -338,7 +343,7 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
-        .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
+        .launch_args = LaunchArgs(effective_num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8FP4MegaMoERuntime::generate(args);

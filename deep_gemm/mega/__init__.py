@@ -17,6 +17,10 @@ from .. import _C
 _MAX_CANDIDATE_BLOCK_M = 192
 
 
+def _is_sm90() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -169,10 +173,12 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+                     fast_math: bool = True,
+                     num_sms: int = 0):
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
-    _C.fp8_fp4_mega_moe(
+    fn = _C.fp8_fp4_mega_moe_sm90 if _is_sm90() else _C.fp8_fp4_mega_moe
+    args = [
         y,
         l1_weights_data, l1_weights_sf,
         l2_weights_data, l2_weights_sf,
@@ -185,7 +191,12 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         sym_buffer.num_ring_tokens
-    )
+    ]
+    if _is_sm90():
+        args.append(num_sms)
+    elif num_sms:
+        raise ValueError('num_sms override is only supported for SM90 MegaMoE')
+    fn(*args)
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
