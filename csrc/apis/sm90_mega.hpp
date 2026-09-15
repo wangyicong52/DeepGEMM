@@ -322,7 +322,7 @@ static void fp8_fp4_mega_moe_sm90(
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT(arch_major == 9);
 
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -375,11 +375,11 @@ static void fp8_fp4_mega_moe_sm90(
     (void)topk_idx;
     (void)topk_weights;
 
-    DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
-    DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
+    DG_HOST_ASSERT(deep_jit::get_env<int>("DG_USE_FP4_ACTS") == 0);
+    DG_HOST_ASSERT(deep_jit::get_env<int>("DG_USE_FP8_COMBINE") == 0);
     if (num_sms_override) {
         DG_HOST_ASSERT(num_sms_override > 1);
-        DG_HOST_ASSERT(num_sms_override <= device_runtime->get_prop()->multiProcessorCount);
+        DG_HOST_ASSERT(num_sms_override <= runtime->get_num_sms());
         DG_HOST_ASSERT(num_sms_override % 2 == 0);
     }
 
@@ -409,7 +409,7 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.swap_ab_fast_amax,
                           num_sms_override);
 
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 

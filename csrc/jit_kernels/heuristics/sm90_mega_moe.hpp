@@ -319,7 +319,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 0;
 
-    const int num_sms = num_sms_override ? num_sms_override : device_runtime->get_num_sms();
+    const int num_sms =
+        num_sms_override ? num_sms_override : runtime->get_num_sms();
     int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
@@ -368,8 +369,9 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_dispatch_threads, num_non_epilogue_threads, fp4_num_epilogue_threads
     };
 
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format(
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG") or
+        deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = std::format(
             "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, i2304_split_n={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
             fp4_i2304_split_n_shape,
