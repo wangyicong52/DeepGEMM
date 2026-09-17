@@ -28,7 +28,8 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  num_ring_tokens: int,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 use_fp8_dispatch: bool = True):
         assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
         self.group = group
         self.num_experts = num_experts
@@ -39,13 +40,21 @@ class SymmBuffer:
         self.num_ring_tokens = num_ring_tokens
 
         # Allocate a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            mma_type, activation,
-            num_ring_tokens
-        )
+        if _is_sm90():
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
+                group.size(), num_experts,
+                num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden,
+                use_fp8_dispatch, activation
+            )
+        else:
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+                group.size(), num_experts,
+                num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden,
+                mma_type, activation,
+                num_ring_tokens
+            )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = (
@@ -58,11 +67,13 @@ class SymmBuffer:
         torch.cuda.synchronize()
 
         # Create input buffer views (as torch tensors, not tvm-ffi tensors).
+        views = slice_input_buffers(self.buffer)
+        if not _is_sm90():
+            views = map(torch.from_dlpack, views)
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = map(
-            torch.from_dlpack, slice_input_buffers(self.buffer))
+         self.l2_acts, self.l2_acts_sf) = views
 
     def destroy(self):
         self.handle = None
@@ -79,34 +90,45 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu') -> SymmBuffer:
+    if use_fp8_dispatch is None:
+        use_fp8_dispatch = (mma_type.split('x')[0] == 'fp8')
+
     # Align token count
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+    alignment_fn = (
+        _C.get_token_alignment_for_sm90_mega_moe
+        if _is_sm90() else
+        _C.get_token_alignment_for_mega_moe
+    )
+    num_max_tokens_per_rank = align(num_max_tokens_per_rank, alignment_fn())
 
     # To save buffer size, we enable ring buffer
     # TODO: move the wave concept into kernel and dynamically schedule
     # TODO: currently decoding may consume more memory than prefill
     # TODO: finer-grained wave
-    num_min_ring_tokens, num_max_ring_tokens = \
-        _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
-    if num_max_tokens_per_rank >= 6144:
-        # We assume must be prefill (decode cannot have such size)
-        # Use the full-pool capacity so prefill keeps the tuned non-wrapping
-        # access pattern from the original MegaMoE implementation.
-        num_experts_per_rank = num_experts // group.size()
-        num_max_recv_tokens = group.size() * num_max_tokens_per_rank
-        num_max_experts_per_token = min(num_topk, num_experts_per_rank)
-        num_ring_tokens = align(
-            num_max_recv_tokens * num_max_experts_per_token +
-            num_experts_per_rank * (_MAX_CANDIDATE_BLOCK_M - 1),
-            _C.get_token_alignment_for_mega_moe())
+    if _is_sm90():
+        num_ring_tokens = 0
     else:
-        # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
-        # the wave heuristics can select the best number of experts per wave
-        # In this case, the budget is roughly ~18 GB
-        num_ring_tokens = _C.get_ring_limit_for_mega_moe(
-            align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
-    num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
-    num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
+        num_min_ring_tokens, num_max_ring_tokens = \
+            _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
+        if num_max_tokens_per_rank >= 6144:
+            # We assume must be prefill (decode cannot have such size)
+            # Use the full-pool capacity so prefill keeps the tuned non-wrapping
+            # access pattern from the original MegaMoE implementation.
+            num_experts_per_rank = num_experts // group.size()
+            num_max_recv_tokens = group.size() * num_max_tokens_per_rank
+            num_max_experts_per_token = min(num_topk, num_experts_per_rank)
+            num_ring_tokens = align(
+                num_max_recv_tokens * num_max_experts_per_token +
+                num_experts_per_rank * (_MAX_CANDIDATE_BLOCK_M - 1),
+                _C.get_token_alignment_for_mega_moe())
+        else:
+            # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
+            # the wave heuristics can select the best number of experts per wave
+            # In this case, the budget is roughly ~18 GB
+            num_ring_tokens = _C.get_ring_limit_for_mega_moe(
+                align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
+        num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
+        num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
 
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
@@ -121,7 +143,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_ring_tokens,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        use_fp8_dispatch=use_fp8_dispatch
     )
 
 
@@ -164,6 +187,51 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
+def transform_weights_for_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    l1_fp8, l1_sf = l1_weights
+
+    def _interleave_one(t, gran: int = 8) -> torch.Tensor:
+        g, n, *rest = t.shape
+        half = n // 2
+        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+        up = t[:, half:].reshape(g, half // gran, gran, *rest)
+        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+
+    return (_interleave_one(l1_fp8), l1_sf), l2_weights
+
+
+def transform_weights_for_mega_moe_sm90_fp4(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    def _pack_fp32_sf_to_ue8m0_kmajor(sf_fp32: torch.Tensor) -> torch.Tensor:
+        assert sf_fp32.dtype == torch.float32, f"unexpected SF dtype {sf_fp32.dtype}"
+        e, n, k_groups = sf_fp32.shape
+        assert k_groups % 4 == 0, f"K/32={k_groups} must be a multiple of 4"
+        bits = sf_fp32.view(torch.int32)
+        ue8m0 = (bits.bitwise_right_shift(23).bitwise_and(0xff)).to(torch.uint8)
+        ue8m0 = ue8m0.contiguous().view(e, n, k_groups // 4, 4)
+        return ue8m0.view(torch.int32).reshape(e, n, k_groups // 4).contiguous()
+
+    def _as_packed_fp4_storage(fp4: torch.Tensor) -> torch.Tensor:
+        assert fp4.dtype in (torch.int8, torch.uint8), f"unexpected FP4 dtype {fp4.dtype}"
+        return fp4.contiguous().view(torch.int8)
+
+    l1_fp4, l1_sf_fp32 = l1_weights
+    l2_fp4, l2_sf_fp32 = l2_weights
+    l1_fp4 = _as_packed_fp4_storage(l1_fp4)
+    l2_fp4 = _as_packed_fp4_storage(l2_fp4)
+    l1_fp4 = _interleave_weights(l1_fp4)
+    l1_sf_fp32 = _interleave_weights(l1_sf_fp32)
+    return (
+        (l1_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l1_sf_fp32)),
+        (l2_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l2_sf_fp32)),
+    )
+
+
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -175,13 +243,26 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
                      num_sms: int = 0):
-    (l1_weights_data, l1_weights_sf) = l1_weights
-    (l2_weights_data, l2_weights_sf) = l2_weights
-    fn = _C.fp8_fp4_mega_moe_sm90 if _is_sm90() else _C.fp8_fp4_mega_moe
-    args = [
+    if _is_sm90():
+        _C.fp8_fp4_mega_moe_sm90(
+            y,
+            l1_weights, l2_weights,
+            cumulative_local_expert_recv_stats,
+            sym_buffer.buffer,
+            sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
+            sym_buffer.num_experts, sym_buffer.num_topk,
+            recipe,
+            activation, activation_clamp,
+            fast_math,
+            num_sms
+        )
+        return
+    if num_sms:
+        raise ValueError('num_sms override is only supported for SM90 MegaMoE')
+    _C.fp8_fp4_mega_moe(
         y,
-        l1_weights_data, l1_weights_sf,
-        l2_weights_data, l2_weights_sf,
+        l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
@@ -191,12 +272,30 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         sym_buffer.num_ring_tokens
-    ]
-    if _is_sm90():
-        args.append(num_sms)
-    elif num_sms:
-        raise ValueError('num_sms override is only supported for SM90 MegaMoE')
-    fn(*args)
+    )
+
+
+def fp8_mega_moe(y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (128, 128, 128),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True):
+    _C.fp8_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,

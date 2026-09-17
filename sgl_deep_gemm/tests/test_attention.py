@@ -325,10 +325,10 @@ def test_paged_mqa_logits():
                     for weights_dtype in ((torch.float, torch.bfloat16) if arch_major == 10 else (torch.float, )):
                         if weights_dtype == torch.bfloat16 and logits_dtype == torch.float:
                             continue
-                        for block_kv in ((32, 64) if arch_major == 10 else (64, )):
+                        for block_kv in (32, 64):
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
-                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
+                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2, 4))):
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
                                             heads = (8, 16, 32, 64) if arch_major == 10 else (32, 64)
                                             head_dims = (64, 128) if (is_fp4 and arch_major == 10) else ((32, 64, 128) if arch_major == 10 else (128, ))

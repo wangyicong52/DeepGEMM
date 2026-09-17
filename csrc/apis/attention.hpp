@@ -221,7 +221,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
         DG_HOST_ASSERT(block_kv == 64 or block_kv == 32);
         sm100_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, batch_size * next_n, next_n, num_sms, is_context_lens_2d, false, nullptr);
     } else if (arch_major == 9) {
-        DG_HOST_ASSERT(block_kv == 64);
+        DG_HOST_ASSERT(block_kv == 64 or block_kv == 32);
         sm90_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, false, nullptr);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -272,7 +272,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         int num_heads_kv, fp4_with_sf_bytes;
         std::tie(num_kv_blocks, block_kv, num_heads_kv, fp4_with_sf_bytes) = get_shape<4>(fused_kv_cache);
         DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64)) or
-                       (arch_major == 9 and block_kv == 64));
+                       (arch_major == 9 and (block_kv == 32 or block_kv == 64)));
         DG_HOST_ASSERT(num_heads_kv == 1 and fp4_with_sf_bytes == head_dim / 2 + static_cast<int>(sizeof(int)));
         DG_HOST_ASSERT(fused_kv_cache.stride(1) == fp4_with_sf_bytes and fused_kv_cache.stride(3) == 1);
         DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kByte);
@@ -306,7 +306,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         int num_heads_kv, head_dim_with_sf;
         std::tie(num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf) = get_shape<4>(fused_kv_cache);
         DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64)) or
-                       (arch_major == 9 and block_kv == 64));
+                       (arch_major == 9 and (block_kv == 32 or block_kv == 64)));
         DG_HOST_ASSERT(num_heads_kv == 1 and head_dim_with_sf == head_dim + static_cast<int>(sizeof(float)));
         DG_HOST_ASSERT(fused_kv_cache.stride(1) == head_dim_with_sf and fused_kv_cache.stride(3) == 1);
         DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kByte);
@@ -354,9 +354,10 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
     }
 
-    // Check schedule metadata
+    // SM90 next_n=4 schedules one entry per two-CTA multicast cluster.
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
-    DG_HOST_ASSERT(_schedule_meta_size == num_sms + 1 and _meta_info_size == 2);
+    const int num_kv_multicast = (arch_major == 9 and next_n == 4) ? 2 : 1;
+    DG_HOST_ASSERT(_schedule_meta_size == num_sms / num_kv_multicast + 1 and _meta_info_size == 2);
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
     DG_HOST_ASSERT(schedule_meta.scalar_type() == torch::kInt);
 
@@ -430,7 +431,7 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
 }
 #endif
 
-#if 0
+#if 1
 
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE

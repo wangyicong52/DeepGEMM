@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/functional.h>
 #include <torch/python.h>
 
 #include "apis/attention.hpp"
@@ -7,6 +8,7 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega.hpp"
+#include "apis/sm90_mega.hpp"
 #include "apis/runtime.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -24,5 +26,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::gemm::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::mega::register_apis(m);
+    deep_gemm::mega::register_sm90_apis(m);
     deep_gemm::runtime::register_apis(m);
 }

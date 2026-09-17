@@ -159,6 +159,7 @@ public:
         int split_kv;
         int num_sms;
         bool is_varlen;
+        int num_next_n_atoms;
 
         int batch_size;
         int next_n;
@@ -189,6 +190,7 @@ static void __instantiate_kernel() {{
             args.batch_size,
             args.next_n,
             args.is_context_lens_2d,
+            args.num_next_n_atoms,
             args.context_lens,
             args.indices,
             args.schedule_metadata
@@ -206,6 +208,7 @@ static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
     DG_HOST_ASSERT(split_kv % block_kv == 0);
+    const int num_next_n_atoms = 1;
 
     const int num_smem_ints = is_varlen ? 3 * aligned_batch_size + 1 : aligned_batch_size;
     const int smem_size = num_smem_ints * static_cast<int>(sizeof(int));
@@ -216,6 +219,7 @@ static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .split_kv = split_kv,
         .num_sms = num_sms,
         .is_varlen = is_varlen,
+        .num_next_n_atoms = num_next_n_atoms,
         .batch_size = batch_size,
         .next_n = next_n,
         .is_context_lens_2d = is_context_lens_2d,
@@ -260,6 +264,7 @@ public:
 
         int num_specialized_threads;
         int num_math_threads;
+        int num_kv_multicast;
 
         LaunchArgs launch_args;
     };
@@ -280,6 +285,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
+        {},
         {}
     >);
 }};
@@ -290,6 +296,7 @@ static void __instantiate_kernel() {{
     args.num_q_stages, args.num_kv_stages,
     args.split_kv,
     args.num_specialized_threads, args.num_math_threads,
+    args.num_kv_multicast,
     to_string(args.logits_dtype));
     }
 
@@ -326,15 +333,22 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const int& split_kv) {
     constexpr int num_specialized_threads = 128;
     constexpr int mma_m = 64;
+    constexpr int compute_block_kv = 64;
     const int num_math_warp_groups = split_kv / mma_m;
     const int num_math_threads = num_math_warp_groups * 128;
     constexpr int num_q_stages = 3, num_kv_stages = 3;
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
+    DG_HOST_ASSERT(compute_block_kv % block_kv == 0);
+    DG_HOST_ASSERT(not is_varlen);
 
-    const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+    // next_n=4 splits its Q rows across a two-CTA multicast cluster.
+    const int num_kv_multicast = next_n == 4 ? 2 : 1;
+    const int next_n_per_cta = next_n / num_kv_multicast;
+    DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 4);
     const auto tensor_map_q = make_tma_2d_desc(q, head_dim, batch_size * next_n * num_heads,
-                                               head_dim, next_n_atom * num_heads,
+                                               head_dim, next_n_per_cta * num_heads,
                                                static_cast<int>(q.stride(2)),
                                                head_dim);
     const auto tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, block_kv, num_kv_blocks,
@@ -346,21 +360,20 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
                                                        block_kv, 1,
                                                        static_cast<int>(kv_cache_scales.stride(0)), 0);
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, batch_size * next_n,
-                                                     num_heads, next_n_atom,
+                                                     num_heads, next_n_per_cta,
                                                      static_cast<int>(weights.stride(0)), 0);
 
     const int swizzle_alignment = head_dim * 8;
-    const int smem_q_size_per_stage = next_n * num_heads * head_dim * static_cast<int>(q.element_size());
-    const int aligned_smem_weight_size_per_stage = align(next_n * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
+    const int smem_q_size_per_stage = next_n_per_cta * num_heads * head_dim * static_cast<int>(q.element_size());
+    const int aligned_smem_weight_size_per_stage = align(next_n_per_cta * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
     const int smem_q_pipe_size = num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) + align(num_q_stages * 8 * 2, swizzle_alignment);
-    const int smem_kv_size_per_stage = block_kv * head_dim * static_cast<int>(kv_cache.element_size());
-    const int aligned_smem_kv_scale_size_per_stage = align(block_kv * static_cast<int>(kv_cache_scales.element_size()), swizzle_alignment);
+    const int smem_kv_size_per_stage = compute_block_kv * head_dim * static_cast<int>(kv_cache.element_size());
+    const int aligned_smem_kv_scale_size_per_stage = align(compute_block_kv * static_cast<int>(kv_cache_scales.element_size()), swizzle_alignment);
     const int smem_kv_pipe_size = num_kv_stages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) + align(num_kv_stages * 8 * 2, swizzle_alignment);
     const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
     const int smem_tmem_ptr = 4;
     const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + smem_umma_barriers + smem_tmem_ptr;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(next_n == 1 or next_n == 2);
 
     const SM90FP8PagedMQALogitsRuntime::Args args = {
         .batch_size = batch_size,
@@ -378,7 +391,7 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
         .context_lens = context_lens.data_ptr<int>(),
         .logits = logits.data_ptr(),
         .block_table = block_table.data_ptr<int>(),
-        .indices = is_varlen ? indices.data_ptr<int>() : nullptr,
+        .indices = nullptr,
         .schedule_meta = schedule_meta.data_ptr<int>(),
         .tensor_map_q = tensor_map_q,
         .tensor_map_kv = tensor_map_kv,
@@ -387,9 +400,10 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
         .logits_dtype = logits_dtype,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
+        .num_kv_multicast = num_kv_multicast,
         .launch_args = LaunchArgs(num_sms,
                                   num_specialized_threads + num_math_threads,
-                                  smem_size)
+                                  smem_size, num_kv_multicast)
     };
     const auto code = SM90FP8PagedMQALogitsRuntime::generate(args);
     const auto runtime = compiler->build("sm90_fp8_paged_mqa_logits", code);
