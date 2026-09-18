@@ -178,6 +178,12 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
+static bool should_enable_i2304_split_n_for_mega_moe_sm90_fp4(
+    const int& intermediate_hidden) {
+    return intermediate_hidden == 2304 and
+           get_env<int>("DG_SM90_FP4_I2304_SPLIT_N", 0) == 1;
+}
+
 static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
@@ -286,12 +292,16 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
-    const bool fp4_flash_or_pro_shape = fp4_flash_shape or fp4_pro_shape;
+    const bool fp4_i2304_split_n_shape =
+        should_enable_i2304_split_n_for_mega_moe_sm90_fp4(
+            intermediate_hidden);
+    const bool fp4_split_n_shape =
+        fp4_flash_shape or fp4_pro_shape or fp4_i2304_split_n_shape;
     // Shape bands depend only on model shape and routing density; kernel bands add tile/thread constraints.
     const bool fp4_split_n_eligible =
         block_m == 64 and block_n % 128 == 0;
     const bool fp4_split_n_shape_band =
-        fp4_flash_or_pro_shape and
+        fp4_split_n_shape and
         expected_tokens_per_expert > 0.0f and
         expected_tokens_per_expert < get_fp4_sm90_prefill_threshold();
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
@@ -360,8 +370,9 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={})",
+            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, i2304_split_n={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
+            fp4_i2304_split_n_shape,
             use_early_b_decode, use_decode_done_mbarrier,
             use_swap_ab, use_swap_ab_fast_amax);
         static std::unordered_set<std::string> printed;
