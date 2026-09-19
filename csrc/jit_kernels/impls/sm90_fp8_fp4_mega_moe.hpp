@@ -79,6 +79,7 @@ public:
         // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
+        bool use_l2_sfa_grouped_tma;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -107,6 +108,8 @@ public:
         std::string source_prefix;
         if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
             source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+        if (args.use_l2_sfa_grouped_tma)
+            source_prefix += "#define DG_MEGA_MOE_FP4_L2_SFA_GROUPED_TMA 1\n";
         return source_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
@@ -232,6 +235,18 @@ static void sm90_fp8_fp4_mega_moe(
         effective_num_sms,
         use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab, use_swap_ab_fast_amax);
+    const int l2_sfa_grouped_tma = get_env<int>(
+        "DG_MEGA_MOE_FP4_L2_SFA_GROUPED_TMA", 0);
+    DG_HOST_ASSERT(l2_sfa_grouped_tma == 0 or l2_sfa_grouped_tma == 1);
+    const bool use_l2_sfa_grouped_tma = l2_sfa_grouped_tma != 0 and
+        num_ranks == 8 and num_experts == 384 and
+        hidden == 5120 and intermediate_hidden == 2304 and num_topk == 6 and
+        use_swap_ab and not use_ss_nsplit and
+        config.block_m == 64 and config.block_n == 128 and config.block_k == 128 and
+        config.num_experts_per_wave == 48 and config.num_stages == 5 and
+        config.num_dispatch_threads == 64 and
+        config.num_non_epilogue_threads == 320 and
+        config.num_epilogue_threads == 256;
 
     // Tensormap construction
     constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)
@@ -302,7 +317,8 @@ static void sm90_fp8_fp4_mega_moe(
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
                                                         config.block_m, kL2ActsSFGranK,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        use_l2_sfa_grouped_tma ? 2 : 1);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
                                                         intermediate_hidden / 2, num_experts_per_rank * hidden,
                                                         config.block_k / 2, config.block_n,
@@ -332,6 +348,7 @@ static void sm90_fp8_fp4_mega_moe(
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
+        .use_l2_sfa_grouped_tma = use_l2_sfa_grouped_tma,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

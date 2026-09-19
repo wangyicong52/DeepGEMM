@@ -1223,6 +1223,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         // BLOCK_N=128 loads two per-64 groups; BLOCK_N=64
                         // loads four per-32 groups so each 32-column L1
                         // output block keeps its own quant scale.
+#ifdef DG_MEGA_MOE_FP4_L2_SFA_GROUPED_TMA
+                        DG_STATIC_ASSERT(kNumL2SFAPerBlockK == 2,
+                                         "Grouped L2 SFA TMA requires two K-scale groups");
+                        tma::copy<BLOCK_M, kNumL2SFAPerBlockK, 0, float>(
+                            tensor_map_sfa_ptr, full_barriers[stage_idx],
+                            smem_sfa[stage_idx],
+                            m_idx, k_block_idx * kNumL2SFAPerBlockK, 1);
+#else
                         #pragma unroll
                         for (uint32_t sf_group = 0; sf_group < kNumL2SFAPerBlockK; ++ sf_group) {
                             tma::copy<BLOCK_M, 1, 0, float>(
@@ -1230,6 +1238,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 smem_sfa[stage_idx] + sf_group * BLOCK_M,
                                 m_idx, k_block_idx * kNumL2SFAPerBlockK + sf_group, 1);
                         }
+#endif
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_A_SIZE_PER_STAGE + kNumL2SFAPerBlockK * BLOCK_M * sizeof(float));
                     }
