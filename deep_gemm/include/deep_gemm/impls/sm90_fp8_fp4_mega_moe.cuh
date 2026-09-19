@@ -163,9 +163,21 @@ CUTLASS_DEVICE void sm90_fp8_fp4_mega_moe_for_each_cached_block(
         if (block_phase == sched::BlockPhase::None)
             break;
 
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+        if (block_phase == sched::BlockPhase::Linear2) {
+            func.template operator()<
+                sched::BlockPhase::Linear2, kNumL2BlockKs>(
+                    current_local_expert_idx, m_block_idx, n_block_idx);
+        } else {
+            func.template operator()<
+                sched::BlockPhase::Linear1, kNumL1BlockKs>(
+                    current_local_expert_idx, m_block_idx, n_block_idx);
+        }
+#else
         func(block_phase, current_local_expert_idx,
              block_phase == sched::BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
              m_block_idx, n_block_idx);
+#endif
     }
 }
 
@@ -1167,10 +1179,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
             scheduler, [&](const sched::BlockPhase& block_phase,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
@@ -1251,10 +1271,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
             scheduler, [&](const sched::BlockPhase& block_phase,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
             const auto tensor_map_b_ptr =
                 block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights : &tensor_map_l1_weights;
 
@@ -1335,10 +1363,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 sm90_fp8_fp4_mega_moe_for_each_cached_block<
                     kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+                    scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                                   const uint32_t& local_expert_idx,
+                                   const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                    constexpr auto block_phase = kBlockPhase;
+                    constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
                     scheduler, [&](const sched::BlockPhase& block_phase,
                                    const uint32_t& local_expert_idx,
                                    const uint32_t& num_k_blocks,
                                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                         wait_fp4_decode_input_ready(stage_idx, phase);
                         decode_fp4_b_stage(stage_idx, decode_thread_idx);
@@ -1408,10 +1444,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
             scheduler, [&](const sched::BlockPhase& block_phase,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -2069,6 +2113,81 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
                     } else {
+#ifdef DG_MEGA_MOE_FP4_ROW_PARALLEL_QUANT
+                        constexpr uint32_t kRowLanes = 8;
+                        constexpr uint32_t kPairsPerLane =
+                            L1_OUT_BLOCK_N / (2 * kRowLanes);
+                        DG_STATIC_ASSERT(
+                            L1_OUT_BLOCK_N % (2 * kRowLanes) == 0,
+                            "Row groups require whole pairs");
+                        const uint32_t row_lane =
+                            epilogue_thread_idx % kRowLanes;
+                        for (uint32_t row_base = 0; row_base < valid_m;
+                             row_base += kNumEpilogueThreads / kRowLanes) {
+                            const uint32_t token =
+                                row_base + epilogue_thread_idx / kRowLanes;
+                            const uint32_t active =
+                                __ballot_sync(0xffffffffu, token < valid_m);
+                            if (token >= valid_m)
+                                continue;
+
+                            float2 values[kPairsPerLane];
+                            float amax = 0.0f;
+                            #pragma unroll
+                            for (uint32_t p = 0; p < kPairsPerLane; ++p) {
+                                const uint32_t col =
+                                    2 * (row_lane + p * kRowLanes);
+                                values[p] =
+                                    *reinterpret_cast<const float2*>(
+                                        smem_cd_swap_l1_fp32 +
+                                        token * L1_OUT_BLOCK_N + col);
+                                amax = cute::max(
+                                    amax, cute::abs(values[p].x));
+                                amax = cute::max(
+                                    amax, cute::abs(values[p].y));
+                            }
+                            #pragma unroll
+                            for (uint32_t delta = kRowLanes / 2;
+                                 delta; delta /= 2) {
+                                amax = cute::max(
+                                    amax,
+                                    __shfl_xor_sync(
+                                        active, amax, delta, kRowLanes));
+                            }
+
+                            float sf_inv = 0.0f;
+                            if (row_lane == 0) {
+                                const float wtok =
+                                    *l1_topk_weights_buffer
+                                         .get_data_buffer(m_idx + token)
+                                         .get_base_ptr<float>();
+                                amax *= cute::abs(wtok);
+                                float2 sf_pair, sf_inv_pair;
+                                sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(
+                                    make_float2(amax, amax),
+                                    sf_pair, sf_inv_pair);
+                                sf_inv = wtok * sf_inv_pair.x;
+                                const uint32_t token_idx =
+                                    pool_block_idx * BLOCK_M + token;
+                                l2_sf_buffer.get_base_ptr<float>()[
+                                    n_block_idx * kNumPaddedSFPoolTokens +
+                                    token_idx] = sf_pair.x;
+                            }
+                            sf_inv = __shfl_sync(
+                                active, sf_inv, 0, kRowLanes);
+                            #pragma unroll
+                            for (uint32_t p = 0; p < kPairsPerLane; ++p) {
+                                const uint32_t col =
+                                    2 * (row_lane + p * kRowLanes);
+                                const __nv_fp8x2_e4m3 pair(make_float2(
+                                    values[p].x * sf_inv,
+                                    values[p].y * sf_inv));
+                                *reinterpret_cast<uint16_t*>(
+                                    smem_cd_swap_l1_fp8 +
+                                    token * L1_OUT_BLOCK_N + col) = pair.__x;
+                            }
+                        }
+#else
                         for (uint32_t token = epilogue_thread_idx; token < valid_m; token += kNumEpilogueThreads) {
                             float amax = 0.0f;
                             #pragma unroll
@@ -2098,6 +2217,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 *ptr = pair.__x;
                             }
                         }
+#endif
                     }
 
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
