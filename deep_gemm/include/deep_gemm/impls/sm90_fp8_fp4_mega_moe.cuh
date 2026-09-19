@@ -401,16 +401,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                           const uint32_t* __restrict__ l2_weights_sf
-#ifdef DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA
-                           , const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_m8
-                           , const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_m16
-                           , const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_m32
-                           , const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_m8
-                           , const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_m16
-                           , const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_m32
-#endif
-                           ) {
+                           const uint32_t* __restrict__ l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -525,10 +516,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         and (kWarpgroupSplitN == 2) and (not kFP4SSNSplit);
     constexpr bool kSwapABL1Active = kSwapABEligible;
     constexpr bool kSwapABL2Active = kSwapABEligible;
-#ifdef DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA
-    DG_STATIC_ASSERT(kSwapABEligible and BLOCK_K == 128,
-                     "Activation row TMA requires the M64/K128 swap-AB path");
-#endif
     constexpr bool kSwapABFastAmaxActive =
         kSwapABL1Active and kFP4SwapABFastAmax;
     // Flash b4 is assigned a distinct epw16 kernel. Keep one intermediate
@@ -1184,29 +1171,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-#ifdef DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA
-            const uint32_t valid_a_rows = scheduler.template get_valid_m<false>();
-            const uint32_t a_rows = valid_a_rows <= 8 ? 8u :
-                valid_a_rows <= 16 ? 16u : valid_a_rows <= 32 ? 32u : 64u;
-            const auto tensor_map_a_ptr =
-                block_phase == sched::BlockPhase::Linear2
-                    ? (a_rows == 8 ? &tensor_map_l2_acts_m8 :
-                       a_rows == 16 ? &tensor_map_l2_acts_m16 :
-                       a_rows == 32 ? &tensor_map_l2_acts_m32 :
-                                      &tensor_map_l2_acts)
-                    : (a_rows == 8 ? &tensor_map_l1_acts_m8 :
-                       a_rows == 16 ? &tensor_map_l1_acts_m16 :
-                       a_rows == 32 ? &tensor_map_l1_acts_m32 :
-                                      &tensor_map_l1_acts);
-            const uint32_t a_tma_bytes =
-                a_rows * BLOCK_K * sizeof(a_dtype_t);
-            DG_STATIC_ASSERT(BLOCK_K == kSwizzleAMode / sizeof(a_dtype_t),
-                             "Activation row TMA requires one inner atom");
-#else
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
-            constexpr uint32_t a_tma_bytes = SMEM_A_SIZE_PER_STAGE;
-#endif
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
 
@@ -1251,7 +1217,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
                             m_idx, k_block_idx, 1);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
-                            a_tma_bytes + BLOCK_M * sizeof(float));
+                            SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(float));
                     } else {
                         // L2 SFA descriptor box is (block_mn, 1).  Default
                         // BLOCK_N=128 loads two per-64 groups; BLOCK_N=64
@@ -1265,7 +1231,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 m_idx, k_block_idx * kNumL2SFAPerBlockK + sf_group, 1);
                         }
                         full_barriers[stage_idx]->arrive_and_expect_tx(
-                            a_tma_bytes + kNumL2SFAPerBlockK * BLOCK_M * sizeof(float));
+                            SMEM_A_SIZE_PER_STAGE + kNumL2SFAPerBlockK * BLOCK_M * sizeof(float));
                     }
                 }
                 __syncwarp();

@@ -79,7 +79,6 @@ public:
         // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
-        bool use_activation_row_buckets;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -99,8 +98,6 @@ public:
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const uint32_t* l2_weights_sf;
-        CUtensorMap tensor_map_l1_act_rows[3];
-        CUtensorMap tensor_map_l2_act_rows[3];
 
         // Launch configs
         LaunchArgs launch_args;
@@ -110,8 +107,6 @@ public:
         std::string source_prefix;
         if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
             source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
-        if (args.use_activation_row_buckets)
-            source_prefix += "#define DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA 1\n";
         return source_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
@@ -169,30 +164,6 @@ static void __instantiate_kernel() {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        if (args.use_activation_row_buckets) {
-            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-                args.y,
-                args.cumulative_local_expert_recv_stats,
-                args.num_tokens,
-                args.sym_buffer_ptrs,
-                args.tensor_map_l1_acts,
-                args.tensor_map_l1_acts_sf,
-                args.tensor_map_l1_weights,
-                args.l1_weights_sf,
-                args.tensor_map_l1_output,
-                args.tensor_map_l2_acts,
-                args.tensor_map_l2_acts_sf,
-                args.tensor_map_l2_weights,
-                args.l2_weights_sf,
-                args.tensor_map_l1_act_rows[0],
-                args.tensor_map_l1_act_rows[1],
-                args.tensor_map_l1_act_rows[2],
-                args.tensor_map_l2_act_rows[0],
-                args.tensor_map_l2_act_rows[1],
-                args.tensor_map_l2_act_rows[2]
-            ));
-            return;
-        }
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
@@ -339,32 +310,6 @@ static void sm90_fp8_fp4_mega_moe(
                                                         config.swizzle_weights_mode, /*swizzle_base=*/0,
                                                         /*allow_tf32=*/false);
 
-    const int activation_row_tma = get_env<int>(
-        "DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA", 0);
-    DG_HOST_ASSERT(activation_row_tma == 0 or activation_row_tma == 1);
-    const bool use_activation_row_buckets = activation_row_tma != 0 and
-        use_swap_ab and not use_ss_nsplit and config.block_m == 64 and
-        config.block_n == 128 and config.num_epilogue_threads == 256 and
-        config.block_k == 128 and config.swizzle_acts_mode == 128 and
-        config.cluster_size == 1;
-    CUtensorMap tensor_map_l1_act_rows[3] = {};
-    CUtensorMap tensor_map_l2_act_rows[3] = {};
-    if (use_activation_row_buckets) {
-        for (int i = 0; i < 3; ++i) {
-            const int rows = 8 << i;
-            tensor_map_l1_act_rows[i] = make_tma_2d_desc(
-                l1_acts, hidden, config.num_max_pool_tokens,
-                config.block_k, rows,
-                static_cast<int>(l1_acts.stride(-2)),
-                config.swizzle_acts_mode);
-            tensor_map_l2_act_rows[i] = make_tma_2d_desc(
-                l2_acts, intermediate_hidden, config.num_max_pool_tokens,
-                config.block_k, rows,
-                static_cast<int>(l2_acts.stride(-2)),
-                config.swizzle_acts_mode);
-        }
-    }
-
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
@@ -387,7 +332,6 @@ static void sm90_fp8_fp4_mega_moe(
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
-        .use_activation_row_buckets = use_activation_row_buckets,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -402,12 +346,6 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
-        .tensor_map_l1_act_rows = {tensor_map_l1_act_rows[0],
-                                   tensor_map_l1_act_rows[1],
-                                   tensor_map_l1_act_rows[2]},
-        .tensor_map_l2_act_rows = {tensor_map_l2_act_rows[0],
-                                   tensor_map_l2_act_rows[1],
-                                   tensor_map_l2_act_rows[2]},
         .launch_args = LaunchArgs(effective_num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
