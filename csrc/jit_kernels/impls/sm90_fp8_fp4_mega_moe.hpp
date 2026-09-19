@@ -107,6 +107,8 @@ public:
         std::string source_prefix;
         if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
             source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_ROW_PARALLEL_QUANT", 0) != 0)
+            source_prefix += "#define DG_MEGA_MOE_FP4_ROW_PARALLEL_QUANT 1\n";
         return source_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
