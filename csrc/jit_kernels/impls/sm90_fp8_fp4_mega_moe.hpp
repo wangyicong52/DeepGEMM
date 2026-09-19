@@ -79,7 +79,6 @@ public:
         // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
-        bool sfb_n_contiguous;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -107,9 +106,7 @@ public:
     static std::string generate_impl(const Args& args) {
         std::string source_prefix;
         if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
-            source_prefix += "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
-        if (args.sfb_n_contiguous)
-            source_prefix += "#define DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS 1\n";
+            source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
         return source_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
@@ -335,9 +332,6 @@ static void sm90_fp8_fp4_mega_moe(
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
-        .sfb_n_contiguous =
-            not l1_weights_sf.is_contiguous() or
-            not l2_weights_sf.is_contiguous(),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

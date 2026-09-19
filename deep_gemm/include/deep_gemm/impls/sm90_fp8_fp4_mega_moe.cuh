@@ -1294,13 +1294,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t n_global = n_block_idx * BLOCK_N + row;
                         smem_sfb[stage_idx][row] = __ldg(sfb_base
                             + local_expert_idx * sfb_per_expert
-#ifdef DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS
-                            + k_block_idx * shape_n
-                            + n_global);
-#else
                             + n_global * sfb_k_words
                             + k_block_idx);
-#endif
                     }
                 }
                 __syncwarp();

@@ -1,4 +1,3 @@
-import os
 import torch
 import types
 import warnings
@@ -215,10 +214,7 @@ def transform_weights_for_mega_moe_sm90_fp4(
         bits = sf_fp32.view(torch.int32)
         ue8m0 = (bits.bitwise_right_shift(23).bitwise_and(0xff)).to(torch.uint8)
         ue8m0 = ue8m0.contiguous().view(e, n, k_groups // 4, 4)
-        packed = ue8m0.view(torch.int32).reshape(e, n, k_groups // 4).contiguous()
-        if int(os.environ.get("DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS", "0")):
-            packed = packed.transpose(1, 2).contiguous().transpose(1, 2)
-        return packed
+        return ue8m0.view(torch.int32).reshape(e, n, k_groups // 4).contiguous()
 
     def _as_packed_fp4_storage(fp4: torch.Tensor) -> torch.Tensor:
         assert fp4.dtype in (torch.int8, torch.uint8), f"unexpected FP4 dtype {fp4.dtype}"
