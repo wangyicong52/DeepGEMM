@@ -107,6 +107,35 @@ public:
         std::string source_prefix;
         if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
             source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+        const bool n64_decode_target = is_sm90_fp4_n64_decode_target(
+            args.num_ranks, args.num_experts,
+            args.num_tokens, args.hidden, args.intermediate_hidden, args.num_topk,
+            args.config.num_experts_per_wave,
+            args.config.block_m, args.config.block_n, args.config.block_k,
+            args.config.num_dispatch_threads,
+            args.config.num_non_epilogue_threads,
+            args.config.num_epilogue_threads,
+            args.use_swap_ab, args.use_decode_done_mbarrier);
+        const int use_proxy_fence =
+            get_env<int>("DG_MEGA_MOE_FP4_PROXY_FENCE", 0);
+        DG_HOST_ASSERT(use_proxy_fence == 0 or use_proxy_fence == 1);
+        const bool n64_decode_ready = use_sm90_fp4_n64_decode_ready(
+            args.num_ranks, args.num_experts,
+            args.num_tokens, args.hidden, args.intermediate_hidden, args.num_topk,
+            args.config.num_experts_per_wave,
+            args.config.block_m, args.config.block_n, args.config.block_k,
+            args.config.num_dispatch_threads,
+            args.config.num_non_epilogue_threads,
+            args.config.num_epilogue_threads,
+            args.use_swap_ab, args.use_decode_done_mbarrier);
+        if (n64_decode_target and (use_proxy_fence != 0 or n64_decode_ready))
+            source_prefix += "#define DG_MEGA_MOE_FP4_PROXY_FENCE 1\n";
+        if (n64_decode_ready) {
+            DG_HOST_ASSERT(not args.math_wg_participates_in_fp4_decode and
+                           args.num_math_wg_decode_warps == 0 and
+                           args.first_fp4_decode_assist_warp == 2);
+            source_prefix += "#define DG_MEGA_MOE_FP4_N64_DECODE_READY 1\n";
+        }
         return source_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
