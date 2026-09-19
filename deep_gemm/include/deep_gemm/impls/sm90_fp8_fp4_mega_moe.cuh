@@ -186,14 +186,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
     constexpr uint32_t kGroupsPerTile = LOAD_BLOCK_N * kNumSFBPerBlockK;
     DG_STATIC_ASSERT(kPackedWordsPerKG == 4, "Wide-load decode assumes per-32K groups");
 
-#ifdef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
-    DG_STATIC_ASSERT(kGroupsPerTile == 512,
-                     "Sixteen helpers require exactly one decode group per thread");
-    const uint32_t group = decode_thread_idx;
-    {
-#else
     for (uint32_t group = decode_thread_idx; group < kGroupsPerTile; group += num_decode_threads) {
-#endif
         const uint32_t n_row = group / kNumSFBPerBlockK;
         const uint32_t kg = group - n_row * kNumSFBPerBlockK;
         const uint32_t sfb_word = smem_sfb_stage[n_row];
@@ -340,9 +333,6 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
             decode_thread_idx, num_decode_threads,
             smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
     }
-#ifdef DG_MEGA_MOE_FP4_PROXY_FENCE
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-#endif
 }
 
 // ============================================================================
@@ -834,32 +824,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Split-N halves the live accumulator footprint per math warpgroup, so it
     // does not need the full 208-register epilogue allocation used by the
     // regular N=128 path.
-    constexpr uint32_t kNumDispatchRegisters     = 48;
-    constexpr uint32_t kNumNonEpilogueRegisters  = 40;
-#ifdef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
-    constexpr uint32_t kNumEpilogueRegisters     = 144;
-    constexpr uint32_t kNumCommWarps =
-        kNumDispatchWarps + kFirstFP4DecodeAssistWarp;
-    DG_STATIC_ASSERT(
-        kNumDispatchThreads == 64 and kNumNonEpilogueThreads == 576 and
-        kNumEpilogueThreads == 256 and kNumThreads == 896 and
-        kNumCommWarps == 4 and kNumMMANonEpilogueWarps -
-        kFirstFP4DecodeAssistWarp == 16,
-        "Sixteen-helper specialization requires 4/16/8 role warps");
-    DG_STATIC_ASSERT(
-        kNumCommWarps * 32 * kNumDispatchRegisters +
-        (kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) *
-            32 * kNumNonEpilogueRegisters +
-        kNumEpilogueThreads * kNumEpilogueRegisters <= 64512,
-        "Too many registers");
-#else
-    constexpr uint32_t kNumEpilogueRegisters =
-        kSplitNWarpgroups ? 160 : 208;
+    constexpr uint32_t kNumDispatchRegisters    = 48;
+    constexpr uint32_t kNumNonEpilogueRegisters = 40;
+    constexpr uint32_t kNumEpilogueRegisters    = kSplitNWarpgroups ? 160 : 208;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
                      "Too many registers");
-#endif
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
@@ -913,16 +884,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         arrive_or_sync_fp4_decode_done(cur_stage_idx);
     };
 
-#ifdef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
-    if (warp_idx < kNumCommWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
-    } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-    } else {
-        cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
-    }
-#endif
-
     // =====================================================================
     // ROLE 1: DISPATCH WARPS
     //   Mirrors SM100 dispatch with two changes:
@@ -933,9 +894,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     //       per-block linear mapping (no 4x32 transpose).
     // =====================================================================
     if (warp_idx < kNumDispatchWarps) {
-#ifndef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
-#endif
 
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
@@ -1203,9 +1162,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     //   warp 1 loads B + SFB, remaining warps are decode-assist only.
     // =====================================================================
     } else if (warp_idx == kNumDispatchWarps) {
-#ifndef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-#endif
         cache_expert_recv_counts();
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
@@ -1289,9 +1246,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         }, cached_recv_counts);
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
-#ifndef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-#endif
         cache_expert_recv_counts();
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
@@ -1369,9 +1324,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // They still participate in the warpgroup-collective
         // `setmaxnreg.dec.sync.aligned` so the math warpgroup's
         // `warpgroup_reg_alloc` can succeed.
-#ifndef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-#endif
         cache_expert_recv_counts();
 
         {
@@ -1398,9 +1351,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     // ROLE 3: MATH WARPGROUPS (WGMMA + epilogue + combine)
     // =====================================================================
-#ifndef DG_MEGA_MOE_FP4_SIXTEEN_HELPERS
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
-#endif
 
         const uint32_t epilogue_warp_idx  = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
         const uint32_t epilogue_wg_idx    = epilogue_warp_idx / 4;

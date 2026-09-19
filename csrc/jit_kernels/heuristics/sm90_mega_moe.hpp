@@ -345,30 +345,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int default_num_non_epilogue_threads =
         fp4_split_n_decode_thread_kernel_band ? 320 :
         (fp4_decode_assist_thread_kernel_band ? 192 : 128);
-    const int sixteen_helpers =
-        get_env<int>("DG_MEGA_MOE_FP4_SIXTEEN_HELPERS", 0);
-    DG_HOST_ASSERT(sixteen_helpers == 0 or sixteen_helpers == 1);
-    const bool use_sixteen_helpers =
-        sixteen_helpers != 0 and
-        get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0 and
-        fp4_i2304_split_n_shape and
-        num_ranks == 8 and num_experts == 384 and num_topk == 6 and
-        num_max_tokens_per_rank == 384 and
-        hidden == 5120 and intermediate_hidden == 2304 and
-        block_m == 64 and block_n == 128 and block_k == 128 and
-        fp4_num_epilogue_threads == 256 and
-        num_experts_per_wave == num_experts_per_rank and
-        use_swap_ab and not use_swap_ab_fast_amax and
-        not use_early_b_decode and use_decode_done_mbarrier and
-        expected_tokens_per_expert >= 6.0f and
-        expected_tokens_per_expert < 16.0f;
-    const int num_non_epilogue_threads =
-        use_sixteen_helpers ? 576 : default_num_non_epilogue_threads;
+    const int num_non_epilogue_threads = default_num_non_epilogue_threads;
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
-    DG_HOST_ASSERT(num_dispatch_threads + num_non_epilogue_threads +
-                   fp4_num_epilogue_threads <= 1024);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
