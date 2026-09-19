@@ -345,7 +345,20 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int default_num_non_epilogue_threads =
         fp4_split_n_decode_thread_kernel_band ? 320 :
         (fp4_decode_assist_thread_kernel_band ? 192 : 128);
-    const int num_non_epilogue_threads = default_num_non_epilogue_threads;
+    const int four_helpers_i2304 =
+        get_env<int>("DG_MEGA_MOE_FP4_I2304_FOUR_HELPERS", 0);
+    DG_HOST_ASSERT(four_helpers_i2304 == 0 or four_helpers_i2304 == 1);
+    const bool use_four_helpers_i2304 =
+        four_helpers_i2304 != 0 and
+        num_ranks == 8 and num_experts == 384 and num_topk == 6 and
+        hidden == 5120 and intermediate_hidden == 2304 and
+        block_m == 64 and block_n == 128 and
+        fp4_num_epilogue_threads == 256 and
+        num_experts_per_wave == num_experts_per_rank and
+        expected_tokens_per_expert >= 6.0f and
+        expected_tokens_per_expert < 16.0f;
+    const int num_non_epilogue_threads =
+        use_four_helpers_i2304 ? 192 : default_num_non_epilogue_threads;
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
