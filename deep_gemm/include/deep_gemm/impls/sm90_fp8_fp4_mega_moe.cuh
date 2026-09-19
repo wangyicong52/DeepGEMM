@@ -163,9 +163,21 @@ CUTLASS_DEVICE void sm90_fp8_fp4_mega_moe_for_each_cached_block(
         if (block_phase == sched::BlockPhase::None)
             break;
 
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+        if (block_phase == sched::BlockPhase::Linear2) {
+            func.template operator()<
+                sched::BlockPhase::Linear2, kNumL2BlockKs>(
+                    current_local_expert_idx, m_block_idx, n_block_idx);
+        } else {
+            func.template operator()<
+                sched::BlockPhase::Linear1, kNumL1BlockKs>(
+                    current_local_expert_idx, m_block_idx, n_block_idx);
+        }
+#else
         func(block_phase, current_local_expert_idx,
              block_phase == sched::BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
              m_block_idx, n_block_idx);
+#endif
     }
 }
 
@@ -1167,10 +1179,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
             scheduler, [&](const sched::BlockPhase& block_phase,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
@@ -1251,10 +1271,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
             scheduler, [&](const sched::BlockPhase& block_phase,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
             const auto tensor_map_b_ptr =
                 block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights : &tensor_map_l1_weights;
 
@@ -1335,10 +1363,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 sm90_fp8_fp4_mega_moe_for_each_cached_block<
                     kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+                    scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                                   const uint32_t& local_expert_idx,
+                                   const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                    constexpr auto block_phase = kBlockPhase;
+                    constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
                     scheduler, [&](const sched::BlockPhase& block_phase,
                                    const uint32_t& local_expert_idx,
                                    const uint32_t& num_k_blocks,
                                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                         wait_fp4_decode_input_ready(stage_idx, phase);
                         decode_fp4_b_stage(stage_idx, decode_thread_idx);
@@ -1408,10 +1444,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+#ifdef DG_MEGA_MOE_FP4_PHASE_SPECIALIZATION
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
+#else
             scheduler, [&](const sched::BlockPhase& block_phase,
                            const uint32_t& local_expert_idx,
                            const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+#endif
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
