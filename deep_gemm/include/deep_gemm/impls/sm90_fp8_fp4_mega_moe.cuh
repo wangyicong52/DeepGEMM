@@ -207,6 +207,17 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
         const uint32_t scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
 
         const uint4 packed = reinterpret_cast<const uint4*>(packed_row)[kg];
+#ifdef DG_MEGA_MOE_FP4_PAIRED_PRMT
+        uint32_t lo_0, hi_0, lo_1, hi_1, lo_2, hi_2, lo_3, hi_3;
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.x, scaled_lut_lo, scaled_lut_hi, lo_0, hi_0);
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.y, scaled_lut_lo, scaled_lut_hi, lo_1, hi_1);
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.z, scaled_lut_lo, scaled_lut_hi, lo_2, hi_2);
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.w, scaled_lut_lo, scaled_lut_hi, lo_3, hi_3);
+#else
         const uint32_t lo_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
             packed.x & 0xffffu, scaled_lut_lo, scaled_lut_hi);
         const uint32_t hi_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
@@ -223,6 +234,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
             packed.w & 0xffffu, scaled_lut_lo, scaled_lut_hi);
         const uint32_t hi_3 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
             packed.w >> 16, scaled_lut_lo, scaled_lut_hi);
+#endif
         ptx::st_shared(
             decoded_row_u64 + swz_seg_0 * 2u,
             lo_0, hi_0, lo_1, hi_1);
@@ -271,6 +283,13 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
             const uint32_t pw_global_0 = kg * kPackedWordsPerKG + pair * 2u;
             const uint32_t packed_0 = packed_row[pw_global_0];
             const uint32_t packed_1 = packed_row[pw_global_0 + 1u];
+#ifdef DG_MEGA_MOE_FP4_PAIRED_PRMT
+            uint32_t lo_0, hi_0, lo_1, hi_1;
+            fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+                packed_0, scaled_lut_lo, scaled_lut_hi, lo_0, hi_0);
+            fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+                packed_1, scaled_lut_lo, scaled_lut_hi, lo_1, hi_1);
+#else
             const uint32_t lo_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
                 packed_0 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
             const uint32_t hi_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
@@ -279,6 +298,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
                 packed_1 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
             const uint32_t hi_1 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
                 packed_1 >> 16, scaled_lut_lo, scaled_lut_hi);
+#endif
             const uint32_t seg_id = pw_global_0 >> 1;
             const uint32_t swz_seg = seg_id ^ row_swizzle;
             ptx::st_shared(
