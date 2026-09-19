@@ -333,10 +333,6 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
             decode_thread_idx, num_decode_threads,
             smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
     }
-#ifdef DG_MEGA_MOE_FP4_PROXY_FENCE
-    // Publish generic-proxy stores before a helper signals its WGMMA consumer.
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-#endif
 }
 
 // ============================================================================
@@ -702,21 +698,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kUseEarlyBDecode = kEarlyBDecode;
     constexpr uint32_t kNumDecodeFullBarriers = kUseEarlyBDecode ? kNumStages : 0;
     constexpr bool kUseDecodeDoneMBarrier = kDecodeDoneMBarrier;
-#ifdef DG_MEGA_MOE_FP4_N64_DECODE_READY
-    constexpr uint32_t kDecodeReadyGroups = 2;
-    DG_STATIC_ASSERT(BLOCK_M == 64 and LOAD_BLOCK_N == 128 and
-                     kSplitNWarpgroups and kNumEpilogueWarpgroups == 2 and
-                     kSwapABEligible and kUseDecodeDoneMBarrier and
-                     kNumMathWGDecodeWarps == 0,
-                     "N64 readiness requires helper-only split-N decode");
-    DG_STATIC_ASSERT((kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) > 0 and
-                     (kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) % 2 == 0,
-                     "N64 readiness partitions whole helper warps equally");
-#else
-    constexpr uint32_t kDecodeReadyGroups = 1;
-#endif
-    constexpr uint32_t kNumDecodeDoneBarriers =
-        kUseDecodeDoneMBarrier ? kNumStages * kDecodeReadyGroups : 0;
+    constexpr uint32_t kNumDecodeDoneBarriers = kUseDecodeDoneMBarrier ? kNumStages : 0;
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
         sfb_start_ptr + kNumStages * SMEM_SFB_SIZE_PER_STAGE);
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + i; });
@@ -774,10 +756,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     constexpr uint32_t kDecodeDoneArrivers =
                         (kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) +
                         kNumMathWGDecodeWarps;
-                    #pragma unroll
-                    for (uint32_t group = 0; group < kDecodeReadyGroups; ++ group)
-                        decode_done_barriers[i * kDecodeReadyGroups + group]->init(
-                            kDecodeDoneArrivers / kDecodeReadyGroups);
+                    decode_done_barriers[i]->init(kDecodeDoneArrivers);
                 }
                 // Each math warp arrives once per stage release.
                 empty_barriers[i]->init(kNumEpilogueWarps);
@@ -882,13 +861,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     auto wait_fp4_decode_done = [&](const uint32_t& cur_stage_idx,
                                     const uint32_t& cur_phase) {
         if constexpr (kUseDecodeDoneMBarrier) {
-            if constexpr (kDecodeReadyGroups == 2) {
-                const uint32_t math_wg =
-                    (warp_idx - kNumDispatchWarps - kNumMMANonEpilogueWarps) / 4;
-                decode_done_barriers[cur_stage_idx * 2 + math_wg]->wait(cur_phase);
-            } else {
-                decode_done_barriers[cur_stage_idx]->wait(cur_phase);
-            }
+            decode_done_barriers[cur_stage_idx]->wait(cur_phase);
         } else {
             ptx::sync_aligned(kNumFP4DecodeBarrierThreads, kFP4DecodeBarrierIdx);
         }
@@ -903,31 +876,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     };
     auto decode_fp4_b_stage = [&](const uint32_t& cur_stage_idx,
                                   const uint32_t& decode_thread_idx) {
-        if constexpr (kDecodeReadyGroups == 2) {
-            constexpr uint32_t kHelpersPerHalf =
-                kNumFP4DecodeWorkerThreads / kDecodeReadyGroups;
-            const uint32_t half = decode_thread_idx / kHelpersPerHalf;
-            const uint32_t half_thread = decode_thread_idx % kHelpersPerHalf;
-            const uint32_t row_offset = half * 64;
-            dequant_fp4_b_tile_to_e4m3_smem_dispatch<
-                64, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                kUseWideLoadDecode>(
-                half_thread, kHelpersPerHalf,
-                smem_b_packed[cur_stage_idx] + row_offset * (BLOCK_K / 2),
-                smem_b[cur_stage_idx] + row_offset * BLOCK_K,
-                smem_sfb[cur_stage_idx] + row_offset);
-            __syncwarp();
-            if (lane_idx == 0)
-                decode_done_barriers[cur_stage_idx * kDecodeReadyGroups + half]->arrive();
-        } else {
-            dequant_fp4_b_tile_to_e4m3_smem_dispatch<
-                LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                kUseWideLoadDecode>(
-                decode_thread_idx, kNumFP4DecodeWorkerThreads,
-                smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx],
-                smem_sfb[cur_stage_idx]);
-            arrive_or_sync_fp4_decode_done(cur_stage_idx);
-        }
+        dequant_fp4_b_tile_to_e4m3_smem_dispatch<
+            LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
+            kUseWideLoadDecode>(
+            decode_thread_idx, kNumFP4DecodeWorkerThreads,
+            smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
+        arrive_or_sync_fp4_decode_done(cur_stage_idx);
     };
 
     // =====================================================================
