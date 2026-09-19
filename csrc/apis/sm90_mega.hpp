@@ -60,7 +60,9 @@ static void check_sm90_fp4_sfb_layout(const torch::Tensor& sf,
     DG_HOST_ASSERT(sf.size(0) == num_groups);
     DG_HOST_ASSERT(sf.size(1) == mn);
     DG_HOST_ASSERT(sf.size(2) == ceil_div(k, 128));
-    DG_HOST_ASSERT(sf.is_contiguous());
+    const bool n_contiguous = sf.stride(0) == mn * ceil_div(k, 128) and
+                              sf.stride(1) == 1 and sf.stride(2) == mn;
+    DG_HOST_ASSERT(sf.is_contiguous() or n_contiguous);
 }
 
 struct FP4SM90APIDefaults {
@@ -354,6 +356,8 @@ static void fp8_fp4_mega_moe_sm90(
                               num_experts_per_rank);
     check_sm90_fp4_sfb_layout(l2_weights_sf, hidden, intermediate_hidden,
                               num_experts_per_rank);
+    DG_HOST_ASSERT(l1_weights_sf.is_contiguous() ==
+                   l2_weights_sf.is_contiguous());
 
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
