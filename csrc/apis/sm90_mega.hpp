@@ -84,7 +84,6 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // single swapAB threshold. The historical per-(shape x e-band) table was
     // tuned point-by-point on benchmark batches; on the shapes that matter it
     // collapsed to constants plus a few sliver bands, so it is retired.
-    (void)intermediate_hidden;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     // Decode -> prefill boundary; keep in sync with the JIT heuristics'
@@ -97,12 +96,15 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force
     // the non-swap path for A/B accuracy comparison.
     const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
+    const bool i2304_decode_early_b =
+        intermediate_hidden == 2304 and decode_band and
+        get_env<int>("DG_SM90_FP4_I2304_EARLY_B_DECODE", 0) != 0;
     return {
         /*math_wg_participates_in_decode=*/ false,
         /*num_math_wg_decode_warps=*/ 0,
         /*first_decode_assist_warp=*/ 2,
         /*wide_load_decode=*/ decode_band,
-        /*early_b_decode=*/ prefill_band,
+        /*early_b_decode=*/ prefill_band or i2304_decode_early_b,
         /*decode_done_mbarrier=*/ expected_tokens_per_expert > 0.0f,
         /*l2_arrival_counter=*/ false,
         /*ss_nsplit=*/ prefill_band,
