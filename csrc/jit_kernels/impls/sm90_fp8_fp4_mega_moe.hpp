@@ -107,6 +107,23 @@ public:
         std::string source_prefix;
         if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
             source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+        const bool use_shared_decode_lut =
+            get_env<int>("DG_MEGA_MOE_FP4_SHARED_DECODE_LUT", 0) != 0 and
+            args.num_max_tokens_per_rank == 384 and
+            args.hidden == 5120 and args.intermediate_hidden == 2304 and
+            args.num_experts == 384 and args.num_topk == 6 and
+            args.num_ranks == 8 and
+            args.config.num_experts_per_wave == 48 and
+            args.config.block_m == 64 and args.config.block_n == 128 and
+            args.config.block_k == 128 and args.config.cluster_size == 1 and
+            args.config.num_stages == 5 and
+            args.config.num_dispatch_threads == 64 and
+            args.config.num_non_epilogue_threads == 320 and
+            args.config.num_epilogue_threads == 256 and
+            args.use_swap_ab and not args.use_swap_ab_fast_amax and
+            not args.use_ss_nsplit;
+        if (use_shared_decode_lut)
+            source_prefix += "#define DG_MEGA_MOE_FP4_SHARED_DECODE_LUT 1\n";
         return source_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
