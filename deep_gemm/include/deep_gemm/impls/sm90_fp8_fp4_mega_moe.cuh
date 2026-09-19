@@ -2069,81 +2069,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
                     } else {
-#ifdef DG_MEGA_MOE_FP4_ROW_PARALLEL_QUANT
-                        constexpr uint32_t kRowLanes = 8;
-                        constexpr uint32_t kPairsPerLane =
-                            L1_OUT_BLOCK_N / (2 * kRowLanes);
-                        DG_STATIC_ASSERT(
-                            L1_OUT_BLOCK_N % (2 * kRowLanes) == 0,
-                            "Row groups require whole pairs");
-                        const uint32_t row_lane =
-                            epilogue_thread_idx % kRowLanes;
-                        for (uint32_t row_base = 0; row_base < valid_m;
-                             row_base += kNumEpilogueThreads / kRowLanes) {
-                            const uint32_t token =
-                                row_base + epilogue_thread_idx / kRowLanes;
-                            const uint32_t active =
-                                __ballot_sync(0xffffffffu, token < valid_m);
-                            if (token >= valid_m)
-                                continue;
-
-                            float2 values[kPairsPerLane];
-                            float amax = 0.0f;
-                            #pragma unroll
-                            for (uint32_t p = 0; p < kPairsPerLane; ++p) {
-                                const uint32_t col =
-                                    2 * (row_lane + p * kRowLanes);
-                                values[p] =
-                                    *reinterpret_cast<const float2*>(
-                                        smem_cd_swap_l1_fp32 +
-                                        token * L1_OUT_BLOCK_N + col);
-                                amax = cute::max(
-                                    amax, cute::abs(values[p].x));
-                                amax = cute::max(
-                                    amax, cute::abs(values[p].y));
-                            }
-                            #pragma unroll
-                            for (uint32_t delta = kRowLanes / 2;
-                                 delta; delta /= 2) {
-                                amax = cute::max(
-                                    amax,
-                                    __shfl_xor_sync(
-                                        active, amax, delta, kRowLanes));
-                            }
-
-                            float sf_inv = 0.0f;
-                            if (row_lane == 0) {
-                                const float wtok =
-                                    *l1_topk_weights_buffer
-                                         .get_data_buffer(m_idx + token)
-                                         .get_base_ptr<float>();
-                                amax *= cute::abs(wtok);
-                                float2 sf_pair, sf_inv_pair;
-                                sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(
-                                    make_float2(amax, amax),
-                                    sf_pair, sf_inv_pair);
-                                sf_inv = wtok * sf_inv_pair.x;
-                                const uint32_t token_idx =
-                                    pool_block_idx * BLOCK_M + token;
-                                l2_sf_buffer.get_base_ptr<float>()[
-                                    n_block_idx * kNumPaddedSFPoolTokens +
-                                    token_idx] = sf_pair.x;
-                            }
-                            sf_inv = __shfl_sync(
-                                active, sf_inv, 0, kRowLanes);
-                            #pragma unroll
-                            for (uint32_t p = 0; p < kPairsPerLane; ++p) {
-                                const uint32_t col =
-                                    2 * (row_lane + p * kRowLanes);
-                                const __nv_fp8x2_e4m3 pair(make_float2(
-                                    values[p].x * sf_inv,
-                                    values[p].y * sf_inv));
-                                *reinterpret_cast<uint16_t*>(
-                                    smem_cd_swap_l1_fp8 +
-                                    token * L1_OUT_BLOCK_N + col) = pair.__x;
-                            }
-                        }
-#else
                         for (uint32_t token = epilogue_thread_idx; token < valid_m; token += kNumEpilogueThreads) {
                             float amax = 0.0f;
                             #pragma unroll
@@ -2173,7 +2098,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 *ptr = pair.__x;
                             }
                         }
-#endif
                     }
 
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
