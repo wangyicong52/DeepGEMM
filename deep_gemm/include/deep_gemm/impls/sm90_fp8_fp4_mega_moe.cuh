@@ -181,12 +181,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
     const uint32_t num_decode_threads,
     const PackedT* __restrict__ smem_b_packed_stage,
     DecodedT* __restrict__ smem_b_stage,
-    const uint32_t* __restrict__ smem_sfb_stage
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-    , const uint32_t* __restrict__ smem_scaled_lut_lo,
-    const uint32_t* __restrict__ smem_scaled_lut_hi
-#endif
-    ) {
+    const uint32_t* __restrict__ smem_sfb_stage) {
     constexpr uint32_t kPackedWordsPerKG = kScaleBGranK / 8;  // 4
     constexpr uint32_t kGroupsPerTile = LOAD_BLOCK_N * kNumSFBPerBlockK;
     DG_STATIC_ASSERT(kPackedWordsPerKG == 4, "Wide-load decode assumes per-32K groups");
@@ -206,15 +201,10 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
         const uint32_t seg_base = kg * 2u;
         const uint32_t swz_seg_0 = seg_base ^ row_swizzle;
         const uint32_t swz_seg_1 = (seg_base + 1u) ^ row_swizzle;
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-        const uint32_t scaled_lut_lo = smem_scaled_lut_lo[e8m0];
-        const uint32_t scaled_lut_hi = smem_scaled_lut_hi[e8m0];
-#else
         const uint64_t scaled_lut =
             fp4_decode_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
         const uint32_t scaled_lut_lo = static_cast<uint32_t>(scaled_lut);
         const uint32_t scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
-#endif
 
         const uint4 packed = reinterpret_cast<const uint4*>(packed_row)[kg];
 #ifdef DG_MEGA_MOE_FP4_PAIRED_PRMT
@@ -266,12 +256,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
     const uint32_t num_decode_threads,
     const PackedT* __restrict__ smem_b_packed_stage,
     DecodedT* __restrict__ smem_b_stage,
-    const uint32_t* __restrict__ smem_sfb_stage
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-    , const uint32_t* __restrict__ smem_scaled_lut_lo,
-    const uint32_t* __restrict__ smem_scaled_lut_hi
-#endif
-    ) {
+    const uint32_t* __restrict__ smem_sfb_stage) {
     constexpr uint32_t kPackedWordsPerKG = kScaleBGranK / 8;  // 4
     constexpr uint32_t kPackedWordPairsPerKG = kPackedWordsPerKG / 2;
     constexpr uint32_t kGroupsPerTile = LOAD_BLOCK_N * kNumSFBPerBlockK;
@@ -288,15 +273,10 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
         auto* decoded_row_u64 = reinterpret_cast<uint64_t*>(
             smem_b_stage + n_row * BLOCK_K);
         const uint32_t row_swizzle = n_row & 7u;
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-        const uint32_t scaled_lut_lo = smem_scaled_lut_lo[e8m0];
-        const uint32_t scaled_lut_hi = smem_scaled_lut_hi[e8m0];
-#else
         const uint64_t scaled_lut =
             fp4_decode_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
         const uint32_t scaled_lut_lo = static_cast<uint32_t>(scaled_lut);
         const uint32_t scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
-#endif
 
         #pragma unroll
         for (uint32_t pair = 0; pair < kPackedWordPairsPerKG; ++ pair) {
@@ -341,30 +321,17 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     const uint32_t num_decode_threads,
     const PackedT* __restrict__ smem_b_packed_stage,
     DecodedT* __restrict__ smem_b_stage,
-    const uint32_t* __restrict__ smem_sfb_stage
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-    , const uint32_t* __restrict__ smem_scaled_lut_lo,
-    const uint32_t* __restrict__ smem_scaled_lut_hi
-#endif
-    ) {
+    const uint32_t* __restrict__ smem_sfb_stage) {
     if constexpr (kUseWideLoadDecode) {
         dequant_fp4_b_tile_to_e4m3_smem_wide_load<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK>(
             decode_thread_idx, num_decode_threads,
-            smem_b_packed_stage, smem_b_stage, smem_sfb_stage
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-            , smem_scaled_lut_lo, smem_scaled_lut_hi
-#endif
-            );
+            smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
     } else {
         dequant_fp4_b_tile_to_e4m3_smem_vec_store<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK>(
             decode_thread_idx, num_decode_threads,
-            smem_b_packed_stage, smem_b_stage, smem_sfb_stage
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-            , smem_scaled_lut_lo, smem_scaled_lut_hi
-#endif
-            );
+            smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
     }
 }
 
@@ -607,10 +574,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     constexpr uint32_t kSharedMemoryAlignment = 1024;
     extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-    __shared__ __align__(16) uint32_t smem_scaled_lut_lo[256];
-    __shared__ __align__(16) uint32_t smem_scaled_lut_hi[256];
-#endif
 
     constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
@@ -756,14 +719,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     // Initialization
     // =====================================================================
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-    if (thread_idx < 256) {
-        const uint64_t scaled_lut =
-            fp4_decode_detail::pack_scaled_e4m3_lut_from_e8m0_const(thread_idx);
-        smem_scaled_lut_lo[thread_idx] = static_cast<uint32_t>(scaled_lut);
-        smem_scaled_lut_hi[thread_idx] = static_cast<uint32_t>(scaled_lut >> 32);
-    }
-#endif
     if (warp_idx == 0) {
         // Clean expert-count shared memory
         #pragma unroll
@@ -925,11 +880,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
             kUseWideLoadDecode>(
             decode_thread_idx, kNumFP4DecodeWorkerThreads,
-            smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-            , smem_scaled_lut_lo, smem_scaled_lut_hi
-#endif
-            );
+            smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
         arrive_or_sync_fp4_decode_done(cur_stage_idx);
     };
 
@@ -1521,11 +1472,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
                             kUseWideLoadDecode>(
                             decode_thread_idx, kNumFP4DecodeWorkerThreads,
-                            smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]
-#ifdef DG_MEGA_MOE_FP4_SHARED_DECODE_LUT
-                            , smem_scaled_lut_lo, smem_scaled_lut_hi
-#endif
-                            );
+                            smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
                     }
                 }
                 if constexpr (kNumMathWGDecodeWarps > 0) {
