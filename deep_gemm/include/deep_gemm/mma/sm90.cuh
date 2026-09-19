@@ -191,16 +191,6 @@ struct TF32MMASelector {
     using type = decltype(select_type());
 };
 
-// Encode the same fields as cute::GmmaDescriptor, with reserved/base bits zero.
-CUTE_HOST_DEVICE constexpr uint64_t
-pack_smem_desc_bits(uint32_t address, int layout_type,
-                    uint32_t leading_byte_offset, uint32_t stride_byte_offset) {
-    return (uint64_t(address >> 4) & 0x3fff) |
-           ((uint64_t(leading_byte_offset >> 4) & 0x3fff) << 16) |
-           ((uint64_t(stride_byte_offset >> 4) & 0x3fff) << 32) |
-           ((uint64_t(layout_type) & 3) << 62);
-}
-
 /// Shared memory descriptor
 template <class PointerType>
 CUTLASS_DEVICE cute::GmmaDescriptor
@@ -210,16 +200,11 @@ make_smem_desc(PointerType smem_ptr, const int& layout_type,
     // NOTES: the default LBO and SBO are for K-major types
     cute::GmmaDescriptor desc;
     const auto uint_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-#if defined(DG_MEGA_MOE_FP4_PACKED_GMMA_DESC) && DG_MEGA_MOE_FP4_PACKED_GMMA_DESC
-    desc.desc_ = pack_smem_desc_bits(
-        uint_ptr, layout_type, leading_byte_offset, stride_byte_offset);
-#else
     desc.bitfield.start_address_ = uint_ptr >> 4;
     desc.bitfield.layout_type_ = layout_type;
     desc.bitfield.leading_byte_offset_ = leading_byte_offset >> 4;
     desc.bitfield.stride_byte_offset_ = stride_byte_offset >> 4;
     desc.bitfield.base_offset_ = 0;
-#endif
     return desc;
 }
 
