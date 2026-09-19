@@ -197,26 +197,6 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_ring_tokens, num_max_tokens_per_rank, num_ranks);
 }
 
-static bool use_sm90_fp4_n64_decode_ready(
-    const int& num_ranks, const int& num_experts,
-    const int& hidden, const int& intermediate_hidden, const int& num_topk,
-    const int& num_experts_per_wave,
-    const int& block_m, const int& block_n, const int& block_k,
-    const int& num_dispatch_threads, const int& num_non_epilogue_threads,
-    const int& num_epilogue_threads,
-    const bool& use_swap_ab, const bool& use_decode_done_mbarrier) {
-    const int enabled = get_env<int>("DG_MEGA_MOE_FP4_N64_DECODE_READY", 0);
-    DG_HOST_ASSERT(enabled == 0 or enabled == 1);
-    return enabled != 0 and
-           num_ranks == 8 and num_experts == 384 and
-           hidden == 5120 and intermediate_hidden == 2304 and num_topk == 6 and
-           num_experts_per_wave == 48 and
-           block_m == 64 and block_n == 128 and block_k == 128 and
-           num_dispatch_threads == 64 and num_non_epilogue_threads == 320 and
-           num_epilogue_threads == 256 and
-           use_swap_ab and use_decode_done_mbarrier;
-}
-
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
@@ -224,7 +204,6 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const bool& use_n64_decode_ready = false,
     const bool& use_swap_ab = false,
     const bool& use_swap_ab_fast_amax = false) {
     constexpr int kSmemAlignment = 1024;
@@ -279,7 +258,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_decode_full_per_stage = use_early_b_decode ? 8 : 0;
     const int smem_decode_done_per_stage =
-        use_decode_done_mbarrier ? (use_n64_decode_ready ? 16 : 8) : 0;
+        use_decode_done_mbarrier ? 8 : 0;
     const int smem_barriers_per_stage =
         2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage;
     const int smem_fixed =
@@ -371,20 +350,12 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
-    const bool use_n64_decode_ready = use_sm90_fp4_n64_decode_ready(
-        num_ranks, num_experts, hidden, intermediate_hidden, num_topk,
-        num_experts_per_wave,
-        block_m, block_n, block_k,
-        num_dispatch_threads, num_non_epilogue_threads,
-        fp4_num_epilogue_threads,
-        use_swap_ab, use_decode_done_mbarrier);
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
         use_early_b_decode, use_decode_done_mbarrier,
-        use_n64_decode_ready,
         use_swap_ab, use_swap_ab_fast_amax);
 
     const auto config = MegaMoESM90Config {
