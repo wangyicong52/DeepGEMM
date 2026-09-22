@@ -6,7 +6,6 @@
 #include "../../utils/exception.hpp"
 #include <format>
 #include "runtime_utils.hpp"
-#include "../../runtime/launch.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
