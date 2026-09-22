@@ -1,6 +1,7 @@
 #pragma once
 
-#include <torch/torch.h>
+#include <format>
+#include <torch/python.h>
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
