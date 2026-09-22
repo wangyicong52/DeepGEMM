@@ -771,6 +771,84 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
 }
 
+static void cublaslt_nvfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                   const std::pair<torch::Tensor, torch::Tensor>& b,
+                                   const torch::Tensor& d,
+                                   const std::optional<torch::Tensor>& c) {
+    // Shape must be `[M, K] @ [N, K].T` with both operands packed FP4 and K-major
+    DG_HOST_ASSERT(a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(a.first.is_contiguous() and b.first.is_contiguous());
+
+    // Type and shape checks
+    // NOTES: shapes are in logical FP4 elements (2 elements per packed byte)
+    const auto [m , packed_k ] = get_shape<2>(a.first);
+    const auto [n , packed_k_] = get_shape<2>(b.first);
+    const auto [m_, n_] = get_shape<2>(d);
+    const auto k = packed_k * 2;
+    DG_HOST_ASSERT(m == m_ and n == n_ and packed_k == packed_k_);
+    DG_HOST_ASSERT(k % 32 == 0);
+
+    // Scaling factors must be UE4M3 bytes (NVFP4 recipe, 16-element blocks) in the
+    // cuBLASLt tiled layout: `[ceil(mn / 128), ceil(k / 64), 32, 4, 4]` in bytes
+    const auto& check_sf = [&](const torch::Tensor& sf, const int& mn) {
+        DG_HOST_ASSERT(sf.scalar_type() == torch::kByte or sf.scalar_type() == torch::kChar);
+        DG_HOST_ASSERT(sf.is_contiguous());
+        DG_HOST_ASSERT(sf.numel() == static_cast<int64_t>(ceil_div(mn, 128)) * ceil_div(k, 64) * 512);
+    };
+    check_sf(a.second, m);
+    check_sf(b.second, n);
+
+    // Early return for trivial cases
+    if (early_return(m, n, k, d, c))
+        return;
+
+    cublaslt_nvfp4_gemm(a.first, a.second, b.first, b.second, d, m, n, k, c.has_value());
+}
+
+static auto get_cublaslt_batched_view(const torch::Tensor& tensor) {
+    DG_HOST_ASSERT(tensor.dim() == 2 or tensor.dim() == 3);
+    return tensor.dim() == 2 ? tensor.unsqueeze(0) : tensor;
+}
+
+static void batched_syrk(const torch::Tensor& a, const torch::Tensor& d) {
+    // D = A @ A.mT. A and D may be either unbatched 2D tensors or batched 3D tensors.
+    const auto a_3d = get_cublaslt_batched_view(a);
+    const auto d_3d = get_cublaslt_batched_view(d);
+    const auto [num_batches, m, k] = get_shape<3>(a_3d);
+    const auto [num_batches_, m_, n_] = get_shape<3>(d_3d);
+    const auto major_a = get_major_type_ab<false>(a_3d);
+    check_major_type_cd<false>(d_3d);
+    DG_HOST_ASSERT(num_batches == num_batches_ and m == m_ and m == n_);
+    DG_HOST_ASSERT(a_3d.scalar_type() == d_3d.scalar_type());
+
+    if (num_batches == 0 or early_return(m, m, k, d_3d, std::nullopt))
+        return;
+    cublaslt_batched_gemm(a_3d, a_3d, d_3d, m, m, k, num_batches, major_a, major_a);
+}
+
+static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
+                         const torch::Tensor& d) {
+    // D = A @ B. A is symmetric by contract; cuBLASLt executes this as strided-batched GEMM.
+    const auto a_3d = get_cublaslt_batched_view(a);
+    const auto b_3d = get_cublaslt_batched_view(b);
+    const auto d_3d = get_cublaslt_batched_view(d);
+    const auto [num_batches, m, m_] = get_shape<3>(a_3d);
+    const auto [num_batches_b, m_b, k] = get_shape<3>(b_3d);
+    const auto [num_batches_d, m_d, k_d] = get_shape<3>(d_3d);
+    const auto major_a = get_major_type_ab<false>(a_3d);
+    check_major_type_cd<false>(d_3d);
+    DG_HOST_ASSERT(num_batches == num_batches_b and num_batches == num_batches_d);
+    DG_HOST_ASSERT(m == m_ and m == m_b and m == m_d and k == k_d);
+    DG_HOST_ASSERT(a_3d.scalar_type() == b_3d.scalar_type() and a_3d.scalar_type() == d_3d.scalar_type());
+
+    if (num_batches == 0 or early_return(m, k, m, d_3d, std::nullopt))
+        return;
+
+    const auto b_transposed = b_3d.transpose(1, 2);
+    const auto major_b = get_major_type_ab<false>(b_transposed);
+    cublaslt_batched_gemm(a_3d, b_transposed, d_3d, m, k, m, num_batches, major_a, major_b);
+}
+
 #if 1
 
 static void register_apis(pybind11::module_& m) {
