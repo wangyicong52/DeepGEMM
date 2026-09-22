@@ -97,61 +97,15 @@ sm100_bf16_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
     }
 
-    // Workspaces
-    const auto workspace = layout::Workspace(
-        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kNumRingTokens);
-    constexpr uint32_t kNumMaxPoolTokens = layout::get_num_max_pool_tokens<uint32_t>(
-        kNumRanks, kNumMaxTokensPerRank, kNumTopk, kNumExpertsPerRank);
-    constexpr bool kRingCoversFullPool = kNumRingTokens >= kNumMaxPoolTokens;
-    const auto get_ring_block_idx = [](const uint32_t& pool_block_idx) {
-        if constexpr (kRingCoversFullPool)
-            return pool_block_idx;
-        else
-            return pool_block_idx % kNumRingBlocks;
-    };
-    const auto get_ring_token_idx = [](const uint32_t& pool_token_idx) {
-        if constexpr (kRingCoversFullPool)
-            return pool_token_idx;
-        else
-            return pool_token_idx % kNumRingTokens;
-    };
-    const auto get_ring_wave_idx = [](const uint32_t& pool_block_idx) {
-        if constexpr (kRingCoversFullPool)
-            return 0u;
-        else
-            return pool_block_idx / kNumRingBlocks;
-    };
-
-    // Token and buffer layouts
-    constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
-    constexpr auto bf16_intermediate_token_layout = layout::Data(kIntermediateHidden * sizeof(nv_bfloat16));
-    constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
-    constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
-    constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
-
-    // Registered inputs
-    const auto input_token_buffer = layout::Buffer(
-        bf16_token_layout, 1, kNumMaxTokensPerRank,
-        workspace.get_end_ptr());
-    const auto input_topk_idx_buffer = layout::Buffer(
-        input_topk_idx_layout, 1, kNumMaxTokensPerRank,
-        input_token_buffer.get_end_ptr());
-    const auto input_topk_weights_buffer = layout::Buffer(
-        input_topk_weights_layout, 1, kNumMaxTokensPerRank,
-        input_topk_idx_buffer.get_end_ptr());
-
-    // L1 inputs
-    const auto l1_token_buffer = layout::Buffer(
-        bf16_token_layout, 1, kNumRingTokens,
-        input_topk_weights_buffer.get_end_ptr());
-    const auto l1_topk_weights_buffer = layout::Buffer(
-        l1_topk_weights_layout, 1, kNumRingTokens,
-        l1_token_buffer.get_end_ptr());
-
-    // L2 inputs
-    const auto l2_token_buffer = layout::Buffer(
-        bf16_intermediate_token_layout, 1, kNumRingTokens,
-        l1_topk_weights_buffer.get_end_ptr()
+    // Workspaces and Buffer
+    const auto buffer = layout::MegaMoEBuffer(
+        sym_buffer.get_base_ptr(),
+        kHidden, kIntermediateHidden,
+        kNumRanks, kNumExperts,
+        kNumMaxTokensPerRank, kNumTopk,
+        kNumRingTokens, 0,
+        /*with_sf=*/ false,
+        kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
 
@@ -541,17 +495,15 @@ sm100_bf16_mega_moe_impl(void* y,
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-            if constexpr (not kRingCoversFullPool) {
-                const auto l1_empty_count_target = get_ring_wave_idx(pool_block_idx) * kNumL1BlockNs;
-                if (l1_empty_count_target > 0) {
-                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(get_ring_block_idx(pool_block_idx));
-                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
-                }
+            const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
+            if (l1_empty_count_target > 0) {
+                const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
             const auto src_base_ptr = sym_buffer.map(
-                input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-            const auto dst_base_ptr = l1_token_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).get_base_ptr();
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -581,11 +533,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
-                // Load weights
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                    current_rank_in_expert_idx);
-                *l1_topk_weights_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = weight;
+                *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
@@ -595,7 +543,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(get_ring_block_idx(pool_block_idx)),
+                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
                 );
             }
@@ -653,11 +601,10 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // Clean L1 and L2 full stuffs and ring buffer counts
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-                    const auto ring_block_idx = get_ring_block_idx(expert_pool_block_offset + j);
-                    *workspace.get_l1_full_count_ptr(ring_block_idx) = 0;
-                    *workspace.get_l1_empty_count_ptr(ring_block_idx) = 0;
-                    *workspace.get_l2_full_count_ptr(ring_block_idx) = 0;
-                    *workspace.get_l2_empty_count_ptr(ring_block_idx) = 0;
+                    *workspace.get_l1_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    *workspace.get_l1_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    *workspace.get_l2_full_mask_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    *workspace.get_l2_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
                 }
                 __syncwarp();
             }
@@ -685,17 +632,18 @@ sm100_bf16_mega_moe_impl(void* y,
             const auto num_k_blocks = math::ceil_div(task_info.shape_k, BLOCK_K);
 
             // Compute pool block offset for this expert
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
+            const uint32_t pool_block_idx = task_info.pool_block_idx;
+            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the token arrival
-            if (block_phase == sched::BlockPhase::Linear1) {
-                const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
-                const auto num_expected_tokens = BLOCK_M * (get_ring_wave_idx(pool_block_idx) + 1);
+            if (task_info.block_phase == sched::BlockPhase::Linear1) {
+                const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
+                const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
-            } else {
-                const auto ptr = workspace.get_l2_full_count_ptr(ring_block_idx);
-                const auto num_expected_blocks = L2_SHAPE_K / (BLOCK_N / 2) * (get_ring_wave_idx(pool_block_idx) + 1);
+            } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
+                const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
+                const auto num_expected_blocks = SHARED_L2_SHAPE_K / (BLOCK_N / 2);
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
@@ -915,20 +863,21 @@ sm100_bf16_mega_moe_impl(void* y,
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
-            const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
+            const uint32_t valid_m = ptx::exchange(task_info.valid_m, 0);
+            const uint32_t pool_block_idx = task_info.pool_block_idx;
+            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t m_idx = block_idx * BLOCK_M;
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;  // Full-pool offset for non-ring metadata
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
-            if (block_phase == sched::BlockPhase::Linear1) {
-                // Wait L2 block empty
-                if constexpr (not kRingCoversFullPool) {
+            if (task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::SharedLinear1) {
+                if (not task_info.is_shared()) {
+                    // Wait L2 block empty
                     const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * get_ring_wave_idx(pool_block_idx);
+                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
                     while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
                 }
 
@@ -1072,7 +1021,6 @@ sm100_bf16_mega_moe_impl(void* y,
                     } else {
                         L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
 
-                    if constexpr (not kRingCoversFullPool) {
                         // Increment L1 empty count for this physical slot (one per N block)
                         ptx::red_add(
                             workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
@@ -1081,11 +1029,12 @@ sm100_bf16_mega_moe_impl(void* y,
                 __syncwarp();
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
-                if constexpr (not kRingCoversFullPool) {
+                if (not task_info.is_shared()) {
                     if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                         ptx::red_add(
                             workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
                     }
+                    __syncwarp();
                 }
 
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");

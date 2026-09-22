@@ -1,6 +1,8 @@
 #pragma once
 
-#include <torch/torch.h>
+#include <cstdio>
+#include <format>
+#include <torch/python.h>
 
 #include "../../runtime/jit.hpp"
 #include "../../utils/exception.hpp"

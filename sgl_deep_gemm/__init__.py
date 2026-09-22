@@ -435,7 +435,18 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+                     fast_math: bool = True,
+                     use_x_scales: bool = False,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None,
+                     l2_act_scales: Optional[torch.Tensor] = None,
+                     *,
+                     activation_alpha: Optional[float] = None,
+                     activation_linear_beta: Optional[float] = None,
+                     num_sms: int = 0):
+    if activation == 'situ' and activation_clamp is not None:
+        raise ValueError('activation_clamp is not supported with SiTU')
+
     if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
         return mega.fp8_fp4_mega_moe(
             y,
@@ -462,7 +473,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        activation_alpha, activation_linear_beta,
+        fast_math, num_sms
     )
 
 
