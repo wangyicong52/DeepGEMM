@@ -243,7 +243,7 @@ struct Workspace {
 
     CUTLASS_DEVICE
     uint64_t* get_l2_arrival_mask_ptr(const uint32_t& pool_block_idx = 0) const {
-        return reinterpret_cast<uint64_t*>(get_l2_full_count_ptr()) + pool_block_idx;
+        return get_l2_full_mask_ptr(pool_block_idx);
     }
 
     // For dispatch pulling

@@ -291,9 +291,6 @@ static void fp8_einsum(const std::string& expr,
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
     }
 }
-#endif
-
-#if 1
 
 static void register_apis(pybind11::module_& m) {
     m.def("einsum", &einsum,
@@ -304,7 +301,5 @@ static void register_apis(pybind11::module_& m) {
           py::arg("d"), py::arg("c") = std::nullopt,
           py::arg("recipe") = std::make_tuple(1, 128, 128));
 }
-
-#endif
 
 } // namespace deep_gemm::einsum

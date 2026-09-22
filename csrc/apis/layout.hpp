@@ -132,10 +132,6 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     DG_HOST_UNREACHABLE("Unknown cases");
 }
 
-#endif
-
-#if 1
-
 static void register_apis(pybind11::module_& m) {
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
       py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),
@@ -161,7 +157,5 @@ static void register_apis(pybind11::module_& m) {
         return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m);
     }, py::arg("expected_m") = std::nullopt);
 }
-
-#endif
 
 } // namespace deep_gemm::layout

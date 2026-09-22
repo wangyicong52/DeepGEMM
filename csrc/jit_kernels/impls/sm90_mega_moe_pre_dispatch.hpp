@@ -4,6 +4,7 @@
 
 #include "../../utils/exception.hpp"
 #include <format>
+#include "../../runtime/launch.hpp"
 
 namespace deep_gemm {
 
