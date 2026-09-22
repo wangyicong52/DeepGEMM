@@ -139,8 +139,12 @@ DG_STATIC_ASSERT(sizeof(sched::TaskInfo<true>) == sizeof(sched::TaskInfo<false>)
 
 // Each finished L1 N block toggles its bit in `l2_full_mask`, so L2 K blocks can start as soon as they are fed
 // NOTES: the mask parity per ring generation relies on the ring capacity, see `get_num_max_live_pool_blocks`
+template <uint32_t L1_SHAPE_N, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          bool kUseMask = (L1_SHAPE_N / BLOCK_N <= 64)>
+struct L2KBlockDependency;
+
 template <uint32_t L1_SHAPE_N, uint32_t BLOCK_N, uint32_t BLOCK_K>
-struct L2KBlockDependency {
+struct L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K, true> {
     static constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
     static constexpr uint32_t kNumL1BlockNsPerL2KBlock = BLOCK_K / (BLOCK_N / 2);
     static constexpr uint64_t kFullMask = kNumL1BlockNs == 64 ? ~0ull : (1ull << kNumL1BlockNs) - 1;
@@ -165,6 +169,34 @@ struct L2KBlockDependency {
     }
 };
 
+// Wider intermediates cannot fit one bit per L1 N block in the readiness word.
+// Reuse that word as a cumulative completion counter and wait for the entire L1
+// result, as in the original ring protocol. L2 empty counts prevent producers
+// from overwriting this generation before all L2 consumers have finished.
+template <uint32_t L1_SHAPE_N, uint32_t BLOCK_N, uint32_t BLOCK_K>
+struct L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K, false> {
+    static constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+    DG_STATIC_ASSERT(BLOCK_K % (BLOCK_N / 2) == 0, "Invalid L1/L2 shape relationship");
+
+    const uint64_t* count_ptr;
+    uint64_t expected_count;
+    bool ready = false;
+
+    CUTLASS_DEVICE L2KBlockDependency(const uint64_t* count_ptr, const uint32_t& generation_idx):
+        count_ptr(count_ptr), expected_count((static_cast<uint64_t>(generation_idx) + 1) * kNumL1BlockNs) {}
+
+    CUTLASS_DEVICE static void arrive(const uint64_t* count_ptr, const uint32_t&) {
+        ptx::red_add_rel(count_ptr, uint64_t{1});
+    }
+
+    CUTLASS_DEVICE void wait(const uint32_t&) {
+        if (not ready) {
+            while (ptx::ld_acq_gpu(count_ptr) < expected_count) {}
+            ready = true;
+        }
+    }
+};
+
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
@@ -175,9 +207,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
-          uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
-          typename WorkspaceT = layout::Workspace>
+          uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
+          uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
 struct MegaMoEScheduler {
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
@@ -200,8 +231,8 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
     DG_STATIC_ASSERT(kNumRingBlocks > 0, "Invalid ring buffer config");
 
-    // Arrival counts
-    const WorkspaceT& workspace;
+    // Workspace
+    const layout::Workspace& workspace;
 
     // Scheduler configs
     static constexpr uint32_t kNumScheduleStages = 2;
@@ -217,8 +248,26 @@ struct MegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const WorkspaceT& workspace): workspace(workspace) {
-        block_idx = blockIdx.x;
+    // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
+    static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
+    uint32_t num_sched_l1_waves = 0;
+
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace):
+        workspace(workspace) {}
+
+    CUTLASS_DEVICE MegaMoEScheduler(const layout::Workspace& workspace,
+                                    Barrier* task_info_full_barriers,
+                                    Barrier* task_info_empty_barriers,
+                                    task_info_t* task_infos):
+        workspace(workspace),
+        task_info_full_barriers(task_info_full_barriers),
+        task_info_empty_barriers(task_info_empty_barriers),
+        task_infos(task_infos) {}
+
+    CUTLASS_DEVICE void advance_sched_pipeline() {
+        DG_STATIC_ASSERT(kNumScheduleStages == 2, "Invalid stages");
+        sched_stage_idx ^= 1;
+        sched_phase ^= sched_stage_idx == 0;
     }
 
     CUTLASS_DEVICE bool get_next_task(task_info_t& task_info) {
@@ -430,6 +479,175 @@ struct MegaMoEScheduler {
         // Sentinel.
         task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
         publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
+    }
+};
+
+// Hopper MegaMoE retains the original wave scheduler. SM100 uses the task
+// producer/consumer scheduler above so shared experts can participate in the
+// same pipeline, while SM90 keeps its tuned single-CTA scheduling contract.
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
+          uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
+          uint32_t kNumExpertsPerRank,
+          uint32_t kNumExpertsPerWave,
+          uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
+          uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
+          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
+          uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
+          typename WorkspaceT = layout::Workspace>
+struct LegacyMegaMoEScheduler {
+    DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
+    DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
+    DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
+    DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
+    DG_STATIC_ASSERT(kNumExpertsPerWave > 0 and kNumExpertsPerWave <= kNumExpertsPerRank, "Invalid wave config");
+    DG_STATIC_ASSERT(kNumSMs % 2 == 0, "Number of SMs must be even");
+    DG_STATIC_ASSERT(kNumL1BlockNs % 2 == 0, "L1 N block count must be even");
+    DG_STATIC_ASSERT(kNumL2BlockNs % 2 == 0, "L2 N block count must be even");
+
+    const WorkspaceT& workspace;
+    BlockPhase next_phase = BlockPhase::Linear1;
+    uint32_t current_local_expert_idx = 0;
+    uint32_t current_num_tokens = 0;
+    uint32_t current_pool_block_offset = 0;
+    uint32_t block_idx = 0;
+    uint32_t m_block_idx = 0;
+    uint32_t n_block_idx = 0;
+    uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
+
+    CUTLASS_DEVICE explicit LegacyMegaMoEScheduler(const WorkspaceT& workspace): workspace(workspace) {
+        block_idx = blockIdx.x;
+    }
+
+    CUTLASS_DEVICE uint32_t get_wave_expert_end_idx() const {
+        const auto aligned = math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
+        return cute::min(aligned, kNumExpertsPerRank);
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
+        uint32_t valid_value = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            valid_value = (expert_idx == i * 32 + ptx::get_lane_idx()) ?
+                stored_num_tokens_per_expert[i] : valid_value;
+        }
+        return ptx::exchange(valid_value, expert_idx % 32);
+    }
+
+    CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& expert_idx) {
+        uint32_t num_blocks = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            if (i * 32 + ptx::get_lane_idx() < expert_idx)
+                num_blocks += math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+        }
+        return __reduce_add_sync(0xffffffff, num_blocks);
+    }
+
+    CUTLASS_DEVICE void advance_expert_idx() {
+        current_pool_block_offset += get_current_num_m_blocks();
+        current_local_expert_idx += 1;
+        current_num_tokens = get_num_tokens(current_local_expert_idx);
+    }
+
+    CUTLASS_DEVICE void set_expert_idx(const uint32_t& expert_idx) {
+        current_local_expert_idx = expert_idx;
+        current_num_tokens = get_num_tokens(expert_idx);
+        current_pool_block_offset = get_pool_block_offset(expert_idx);
+    }
+
+    CUTLASS_DEVICE uint32_t get_current_pool_block_offset() const {
+        return current_pool_block_offset;
+    }
+
+    CUTLASS_DEVICE uint32_t get_current_num_m_blocks() const {
+        return math::ceil_div(current_num_tokens, BLOCK_M);
+    }
+
+    template <bool kDoUMMAAligned = false>
+    CUTLASS_DEVICE uint32_t get_valid_m() const {
+        const auto m = cute::min(current_num_tokens - m_block_idx * BLOCK_M, BLOCK_M);
+        return kDoUMMAAligned ? math::align(m, 16u) : m;
+    }
+
+    CUTLASS_DEVICE bool fetch_next_l1_block() {
+        const auto wave_end_expert_idx = get_wave_expert_end_idx();
+        while (current_local_expert_idx < wave_end_expert_idx) {
+            const auto num_m_blocks = get_current_num_m_blocks();
+            m_block_idx = block_idx / kNumL1BlockNs;
+            if (m_block_idx < num_m_blocks)
+                return true;
+            block_idx -= num_m_blocks * kNumL1BlockNs;
+            advance_expert_idx();
+        }
+        return false;
+    }
+
+    CUTLASS_DEVICE bool fetch_next_l2_block() {
+        const auto wave_end_expert_idx = get_wave_expert_end_idx();
+        while (current_local_expert_idx < wave_end_expert_idx) {
+            const auto num_m_blocks = get_current_num_m_blocks();
+            if (block_idx < num_m_blocks * kNumL2BlockNs) {
+                m_block_idx = block_idx / kNumL2BlockNs;
+                return true;
+            }
+            block_idx -= num_m_blocks * kNumL2BlockNs;
+            advance_expert_idx();
+        }
+        return false;
+    }
+
+    CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
+        while (current_local_expert_idx < kNumExpertsPerRank) {
+            if (next_phase == BlockPhase::Linear1) {
+                if (fetch_next_l1_block()) {
+                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                    block_idx += kNumSMs;
+                    return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                }
+                next_phase = BlockPhase::Linear2;
+                set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
+            } else {
+                if (fetch_next_l2_block()) {
+                    n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+                    block_idx += kNumSMs;
+                    return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                }
+                next_phase = BlockPhase::Linear1;
+            }
+        }
+        return {BlockPhase::None, 0, 0, 0};
+    }
+
+    CUTLASS_DEVICE void fetch_expert_recv_count() {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            uint64_t value = 0;
+            if (expert_idx < kNumExpertsPerRank) {
+                do {
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+            }
+            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+        }
+        __syncwarp();
+    }
+
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_block(Func&& func) {
+        fetch_expert_recv_count();
+        set_expert_idx(0);
+        while (true) {
+            CUTE_TIE_DECL(get_next_block(), block_phase, local_expert_idx, block_m_idx, block_n_idx);
+            if (block_phase == BlockPhase::None)
+                break;
+            func(block_phase, local_expert_idx,
+                 block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
+                 block_m_idx, block_n_idx);
+        }
     }
 };
 
