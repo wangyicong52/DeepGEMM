@@ -62,8 +62,7 @@ class SymmBuffer:
                 group.size(), num_experts,
                 num_max_tokens_per_rank, num_topk,
                 hidden, intermediate_hidden,
-                mma_type, activation,
-                num_ring_tokens
+                mma_type, activation, num_shared_experts
             )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -78,14 +77,20 @@ class SymmBuffer:
 
         # Create input buffer views (as torch tensors, not tvm-ffi tensors).
         views = slice_input_buffers(self.buffer)
-        if not _is_sm90():
-            views = map(torch.from_dlpack, views)
-        (self.x, self.x_sf,
-         self.topk_idx, self.topk_weights,
-         self.shared_l1_acts, self.shared_l1_acts_sf,
-         self.shared_l2_acts, self.shared_l2_acts_sf,
-         self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = views
+        if _is_sm90():
+            (self.x, self.x_sf,
+             self.topk_idx, self.topk_weights,
+             self.l1_acts, self.l1_acts_sf,
+             self.l2_acts, self.l2_acts_sf) = views
+            self.shared_l1_acts = self.shared_l1_acts_sf = None
+            self.shared_l2_acts = self.shared_l2_acts_sf = None
+        else:
+            (self.x, self.x_sf,
+             self.topk_idx, self.topk_weights,
+             self.shared_l1_acts, self.shared_l1_acts_sf,
+             self.shared_l2_acts, self.shared_l2_acts_sf,
+             self.l1_acts, self.l1_acts_sf,
+             self.l2_acts, self.l2_acts_sf) = views
 
     def destroy(self):
         self.handle = None
@@ -274,7 +279,10 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
+                     activation_alpha: float = 1.0,
+                     activation_beta: float = 0.0,
                      num_sms: int = 0):
+    _validate_activation(activation)
     if _is_sm90():
         _C.fp8_fp4_mega_moe_sm90(
             y,
@@ -286,6 +294,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             sym_buffer.num_experts, sym_buffer.num_topk,
             recipe,
             activation, activation_clamp,
+            activation_alpha, activation_beta,
             fast_math,
             num_sms
         )

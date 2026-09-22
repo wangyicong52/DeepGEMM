@@ -55,14 +55,17 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_swiglu(float g, float u) {
     return sm90_fp8_mega_moe_silu<kFastMath>(g) * u;
 }
 
+// Continuous FP32 activation scale. SM90 WGMMA has no hardware block-scale operand (the SF
+// is a plain FFMA in the epilogue), so the previous UE8M0 (power-of-two) scale bought nothing
+// on SM90 and only cost precision; the SF pool is already fp32, so this is byte/layout neutral.
+// clamp amax before the reciprocal: padded rows have amax==0, and 448/0=inf -> 0*inf=NaN.
 __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     const float2& amax, float2& sf, float2& sf_inv) {
     constexpr float kScale = 1.0f / 448.0f;
-    const auto scaled = make_float2(__fmul_rn(amax.x, kScale), __fmul_rn(amax.y, kScale));
-    const auto exp_x = math::fast_log2_ceil(scaled.x);
-    const auto exp_y = math::fast_log2_ceil(scaled.y);
-    sf.x = math::fast_pow2(exp_x), sf_inv.x = math::fast_pow2(-exp_x);
-    sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
+    const auto ax = fmaxf(amax.x, 1e-10f);
+    const auto ay = fmaxf(amax.y, 1e-10f);
+    sf.x = __fmul_rn(ax, kScale), sf_inv.x = 1.0f / sf.x;
+    sf.y = __fmul_rn(ay, kScale), sf_inv.y = 1.0f / sf.y;
 }
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -76,7 +79,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1BlockKs, uint32_t kNumL2BlockKs,
           typename WorkspaceT, typename L1Func, typename L2Func>
 CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
-    sched::MegaMoEScheduler<BLOCK_M, BLOCK_N, BLOCK_K,
+    sched::LegacyMegaMoEScheduler<BLOCK_M, BLOCK_N, BLOCK_K,
                             L1_SHAPE_N, L1_SHAPE_K,
                             L2_SHAPE_N, L2_SHAPE_K,
                             kNumExpertsPerRank,
@@ -184,7 +187,8 @@ sm90_fp8_mega_moe_impl(void* y,
                      "Math warpgroup start must be 128-thread aligned");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-    DG_STATIC_ASSERT(BLOCK_M % 64 == 0, "BLOCK_M must be a multiple of WGMMA::M (64)");
+    DG_STATIC_ASSERT(BLOCK_M == 64 or BLOCK_M == 128,
+                     "SM90 MegaMoE SF sizing assumes BLOCK_M is 64 or 128");
     DG_STATIC_ASSERT(BLOCK_N == 128 or BLOCK_N == 256 or BLOCK_N == 512,
                      "SM90 MegaMoE supports CTA BLOCK_N=128/256/512");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
@@ -421,7 +425,7 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N;
     constexpr uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
     constexpr uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
-    auto scheduler = sched::MegaMoEScheduler<
+    auto scheduler = sched::LegacyMegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,

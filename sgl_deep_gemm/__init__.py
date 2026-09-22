@@ -442,7 +442,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l2_act_scales: Optional[torch.Tensor] = None,
                      *,
                      activation_alpha: Optional[float] = None,
-                     activation_linear_beta: Optional[float] = None):
+                     activation_linear_beta: Optional[float] = None,
+                     num_sms: int = 0):
     if activation == 'situ' and activation_clamp is not None:
         raise ValueError('activation_clamp is not supported with SiTU')
 
@@ -472,7 +473,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        activation_alpha, activation_linear_beta,
+        fast_math, num_sms
     )
 
 
