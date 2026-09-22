@@ -74,7 +74,7 @@ static std::string to_string(const at::ScalarType& dtype, const bool& fp4_unpack
 
 static std::string to_string(const float& v) {
     if (std::isfinite(v)) {
-        return std::format("{}0x{:a}f", std::signbit(v) ? "-" : "", std::abs(v));
+        return std::format("{}{:a}f", std::signbit(v) ? "-" : "", std::abs(v));
     } else if (std::isinf(v)) {
         return v > 0 ? "cute::numeric_limits<float>::infinity()"
                      : "-cute::numeric_limits<float>::infinity()";
