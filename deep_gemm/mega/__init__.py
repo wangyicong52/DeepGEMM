@@ -21,12 +21,20 @@ def _is_sm90() -> bool:
     return torch.cuda.get_device_capability()[0] == 9
 
 
+_SUPPORTED_ACTIVATIONS = ('swiglu', 'situ')
+
+
+def _validate_activation(activation: str) -> None:
+    assert activation in _SUPPORTED_ACTIVATIONS, \
+        f'Activation must be one of {_SUPPORTED_ACTIVATIONS}, got `{activation}`'
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
-                 num_ring_tokens: int,
+                 num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
                  use_fp8_dispatch: bool = True):
@@ -37,7 +45,9 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
-        self.num_ring_tokens = num_ring_tokens
+        self.num_shared_experts = num_shared_experts
+        self.mma_type = mma_type
+        self.activation = activation
 
         # Allocate a symmetric buffer
         if _is_sm90():
@@ -72,6 +82,8 @@ class SymmBuffer:
             views = map(torch.from_dlpack, views)
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
+         self.shared_l1_acts, self.shared_l1_acts_sf,
+         self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = views
 
@@ -83,10 +95,12 @@ class SymmBuffer:
         self.x_sf = None
 
 
+# TODO: remove this function
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
                                  hidden: int, intermediate_hidden: int,
+                                 num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu') -> SymmBuffer:
@@ -150,20 +164,36 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
 
 def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]
+    # Unsqueeze for 2D
+    assert t.dim() in (2, 3)
+    squeeze_group_dim = t.dim() == 2
+    if squeeze_group_dim:
+        t = t.unsqueeze(0)
+
+    # Transpose
     g, n, *rest = t.shape
     half = n // 2
     gate = t[:, :half].reshape(g, half // gran, gran, *rest)
     up = t[:, half:].reshape(g, half // gran, gran, *rest)
-    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    result = torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    # Unsqueeze for 2D
+    assert sf.dtype == torch.int and sf.dim() in (2, 3)
+    squeeze_group_dim = sf.dim() == 2
+    if squeeze_group_dim:
+        sf = sf.unsqueeze(0)
+
+    # Transpose
     num_groups, mn, packed_sf_k = sf.shape
-    assert sf.dtype == torch.int and mn % 128 == 0
+    assert mn % 128 == 0
     result = (sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
                 .transpose(2, 3)
                 .reshape(num_groups, mn, packed_sf_k))
-    return torch.empty_like(sf).copy_(result)
+    result = torch.empty_like(sf).copy_(result)
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
 def transform_weights_for_mega_moe(
@@ -171,10 +201,10 @@ def transform_weights_for_mega_moe(
     l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+           Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+    _validate_activation(activation)
     if isinstance(l1_weights, tuple):
-        # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+        # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
         l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
         l1_transformed = (l1_w, l1_sf)
@@ -237,6 +267,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
                      sym_buffer: SymmBuffer,
+                     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
@@ -263,6 +295,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
@@ -271,7 +304,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         recipe,
         activation, activation_clamp,
         fast_math,
-        sym_buffer.num_ring_tokens
+        activation_alpha, activation_beta
     )
 
 
@@ -301,14 +334,22 @@ def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,
                   sym_buffer: SymmBuffer,
+                  shared_l1_weights: Optional[torch.Tensor] = None,
+                  shared_l2_weights: Optional[torch.Tensor] = None,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  activation_alpha: float = 1.0,
+                  activation_beta: float = 0.0):
+    assert activation == 'swiglu', \
+        f'BF16 Mega MoE only supports `swiglu`, got `{activation}`'
     _C.bf16_mega_moe(
         y,
         l1_weights,
         l2_weights,
+        shared_l1_weights,
+        shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs,
@@ -318,7 +359,7 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_topk,
         activation, activation_clamp,
         fast_math,
-        sym_buffer.num_ring_tokens
+        activation_alpha, activation_beta
     )
 
 

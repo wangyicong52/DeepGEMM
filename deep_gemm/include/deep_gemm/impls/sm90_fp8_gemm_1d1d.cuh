@@ -159,7 +159,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, false, 128u, 128u>(shape_m, shape_n, shape_k, grouped_layout);
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, true, 128u, 128u>(shape_m, shape_n, shape_k, grouped_layout);
 
     // TMA and MMA pipeline
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
@@ -177,6 +177,9 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
 
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if (kGemmType == GemmType::KGroupedContiguous and scheduler.current_shape_k == 0)
+                    continue;
+
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
@@ -192,11 +195,19 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                     last_group_idx = scheduler.current_group_idx;
 
                     // Directly update current tensor map
-                    const uint64_t current_k_offset = scheduler.current_k_cumsum;
+                    const uint64_t current_k_offset = scheduler.current_k_start;
                     ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_a, gmem_a_ptr + current_k_offset * shape_m);
                     ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_b, gmem_b_ptr + current_k_offset * shape_n);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_a, scheduler.current_shape_k, scheduler.current_shape_k);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_b, scheduler.current_shape_k, scheduler.current_shape_k);
+
+                    // Make sure the tensor maps are not used by in-flight TMA loads before updating GMEM
+                    cute::tma_desc_commit_group();
+                    cute::tma_desc_wait_group();
+                    // Only used to prevent `ptxas` from moving the following GMEM stores before `cute::tma_desc_wait_group()`.
+                    // Shouldn't be needed otherwise, since we only use one thread
+                    __syncwarp(1u << lane_idx);
+
                     *(gmem_tensor_map_a) = *(smem_tensor_map_a);
                     *(gmem_tensor_map_b) = *(smem_tensor_map_b);
                     ptx::tensor_map_release_gpu();
@@ -215,7 +226,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                     // Issue TMA
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    const uint32_t sf_k_idx = scheduler.current_sf_k_cumsum + k_block_idx;
+                    const uint32_t sf_k_idx = scheduler.current_k_start / BLOCK_K + k_block_idx;
                     const auto tensor_map_a_ptr = (kGemmType == GemmType::KGroupedContiguous ? gmem_tensor_map_a : &tensor_map_a_base);
                     const auto tensor_map_b_ptr = (kGemmType == GemmType::KGroupedContiguous ? gmem_tensor_map_b : &tensor_map_b_base);
                     tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier, smem_sfa[stage_idx], m_idx, sf_k_idx, num_tma_multicast_a);
@@ -246,6 +257,9 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            if (kGemmType == GemmType::KGroupedContiguous and scheduler.current_shape_k == 0)
+                continue;
+
             // Accumulation for WGMMA or CUDA promotion
             DG_STATIC_ASSERT(BLOCK_M == WGMMA::M * (BLOCK_M <= 64 ? 1 : 2), "Invalid block sizes");
             const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);

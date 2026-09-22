@@ -1,84 +1,12 @@
 #pragma once
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include <format>
+
+#include "../../runtime/runtime.hpp"
 #include "../heuristics/sm90.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
-
-class SM90FP8MQALogitsRuntime final: public LaunchRuntime<SM90FP8MQALogitsRuntime> {
-public:
-    struct Args {
-        int seq_len;
-        int seq_len_kv;
-        int max_seqlen_k;
-        int stride_logits;
-        int num_heads, head_dim;
-        bool is_compressed_logits;
-
-        int num_q_stages;
-        int num_kv_stages;
-        int block_q;
-        int block_kv;
-
-        int* cu_seq_len_k_start;
-        int* cu_seq_len_k_end;
-        void* logits;
-
-        CUtensorMap tensor_map_q;
-        CUtensorMap tensor_map_kv;
-        CUtensorMap tensor_map_kv_scales;
-        CUtensorMap tensor_map_weights;
-        at::ScalarType logits_dtype;
-
-        int num_specialized_threads;
-        int num_math_threads;
-
-        LaunchArgs launch_args;
-    };
-
-    static std::string generate_impl(const Args& args) {
-        DG_HOST_ASSERT(128 % args.num_heads == 0);
-
-        return fmt::format(R"(
-#include <deep_gemm/impls/sm90_fp8_mqa_logits.cuh>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm90_fp8_mqa_logits<
-        {}, {},
-        {},
-        {}, {},
-        {}, {},
-        {},
-        {}, {},
-        {}
-    >);
-}};
-)",
-    args.num_heads, args.head_dim,
-    args.is_compressed_logits,
-    args.block_q, args.block_kv,
-    args.num_q_stages, args.num_kv_stages,
-    args.launch_args.grid_dim.first,
-    args.num_specialized_threads, args.num_math_threads,
-    to_string(args.logits_dtype));
-    }
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.seq_len, args.seq_len_kv,
-            args.max_seqlen_k, args.stride_logits,
-            args.cu_seq_len_k_start, args.cu_seq_len_k_end,
-            args.logits,
-            args.tensor_map_q, args.tensor_map_kv,
-            args.tensor_map_kv_scales, args.tensor_map_weights
-        ));
-    }
-};
 
 static void sm90_fp8_mqa_logits(const torch::Tensor& q,
                                 const torch::Tensor& kv, const torch::Tensor& kv_scales,
@@ -90,14 +18,17 @@ static void sm90_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& seq_len, const int& seq_len_kv,
                                 const int& max_seqlen_k, const int& stride_logits,
                                 const int& num_heads, const int& head_dim,
-                                const int& block_q, const int& block_kv) {
+                                const int& block_q, const int& block_kv,
+                                const bool& clean_logits) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 3, num_kv_stages = 3;
     constexpr int num_math_threads = 512;
 
     const bool is_compressed_logits = (max_seqlen_k > 0);
+    const int num_sms = runtime->get_num_sms();
+    DG_HOST_ASSERT(not (clean_logits and is_compressed_logits));
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
     const auto tensor_map_q = make_tma_2d_desc(q, head_dim, seq_len * num_heads,
                                                head_dim, block_q * num_heads, head_dim, head_dim);
@@ -107,7 +38,8 @@ static void sm90_fp8_mqa_logits(const torch::Tensor& q,
                                                        get_tma_aligned_size(seq_len_kv, static_cast<int>(kv_scales.element_size())),
                                                        1, block_kv, 1, 0, 0);
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, seq_len,
-                                                     num_heads, block_q, num_heads, 0);
+                                                     num_heads, block_q,
+                                                     static_cast<int>(weights.stride(0)), 0);
 
     int smem_size = 0;
     const int smem_q_size_per_stage = block_q * num_heads * head_dim * static_cast<int>(q.element_size());
@@ -122,35 +54,7 @@ static void sm90_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += 4;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
 
-    const SM90FP8MQALogitsRuntime::Args args = {
-        .seq_len = seq_len,
-        .seq_len_kv = seq_len_kv,
-        .max_seqlen_k = max_seqlen_k,
-        .stride_logits = stride_logits,
-        .num_heads = num_heads, .head_dim = head_dim,
-        .is_compressed_logits = is_compressed_logits,
-        .num_q_stages = num_q_stages,
-        .num_kv_stages = num_kv_stages,
-        .block_q = block_q,
-        .block_kv = block_kv,
-        .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
-        .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
-        .logits = logits.data_ptr(),
-        .tensor_map_q = tensor_map_q,
-        .tensor_map_kv = tensor_map_kv,
-        .tensor_map_kv_scales = tensor_map_kv_scales,
-        .tensor_map_weights = tensor_map_weights,
-        .logits_dtype = logits_dtype,
-        .num_specialized_threads = num_specialized_threads,
-        .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
-                                  num_specialized_threads + num_math_threads,
-                                  smem_size)
-    };
-    const auto code = SM90FP8MQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_mqa_logits", code);
-    SM90FP8MQALogitsRuntime::launch(runtime, args);
-}
+    DG_HOST_ASSERT(128 % num_heads == 0);
 
 class SM90PagedMQALogitsMetadataRuntime final: public LaunchRuntime<SM90PagedMQALogitsMetadataRuntime> {
 public:
@@ -300,17 +204,67 @@ static void __instantiate_kernel() {{
     to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.batch_size,
-            args.logits_stride, args.block_table_stride,
-            args.context_lens, args.logits,
-            args.block_table, args.indices, args.schedule_meta,
-            args.tensor_map_q, args.tensor_map_kv,
-            args.tensor_map_kv_scales, args.tensor_map_weights
-        ));
-    }
-};
+    // Launch
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = smem_size,
+            .grid_dim = dim3(num_sms, 1, 1),
+            .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
+        },
+        seq_len, seq_len_kv,
+        max_seqlen_k, stride_logits,
+        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
+        logits.data_ptr(),
+        tensor_map_q, tensor_map_kv,
+        tensor_map_kv_scales, tensor_map_weights
+    );
+}
+
+static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+                                           const torch::Tensor& schedule_metadata,
+                                           const int& batch_size, const int& next_n,
+                                           const int& block_kv, const int& num_clusters,
+                                           const bool& is_context_lens_2d,
+                                           const int& num_next_n_atoms,
+                                           const bool& is_varlen, const int* indices_ptr) {
+    constexpr int split_kv = 256;
+    constexpr int num_threads = 32;
+    const int aligned_batch_size = align(batch_size, 32);
+    DG_HOST_ASSERT(split_kv % block_kv == 0);
+
+    const int num_smem_ints = is_varlen ? 3 * aligned_batch_size + 1 : aligned_batch_size;
+    const int smem_size = num_smem_ints * static_cast<int>(sizeof(int));
+    DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+
+    // Compile
+    const auto kernel = jit->compile("sm90_paged_mqa_logits_metadata", std::format(R"(
+#include <deep_gemm/scheduler/sm90_paged_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sched::sm90_paged_mqa_logits_metadata<
+        {}, {}, {}, {}
+    >);
+}};
+)", aligned_batch_size, split_kv, num_clusters, is_varlen ? "true" : "false"));
+
+    // Launch
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = smem_size,
+            .grid_dim = dim3(1, 1, 1),
+            .block_dim = dim3(num_threads, 1, 1),
+        },
+        batch_size,
+        next_n,
+        is_context_lens_2d,
+        num_next_n_atoms,
+        context_lens.data_ptr<int>(),
+        const_cast<int*>(indices_ptr),
+        schedule_metadata.data_ptr<int>()
+    );
+}
 
 static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const torch::Tensor& kv_cache,
