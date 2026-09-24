@@ -304,10 +304,32 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
-static bool should_enable_i2304_split_n_for_mega_moe_sm90_fp4(
-    const int& intermediate_hidden) {
-    return intermediate_hidden == 2304 and
-           deep_jit::get_env<int>("DG_SM90_FP4_I2304_SPLIT_N", 0) == 1;
+static bool should_enable_v41_flash_split_n_for_mega_moe_sm90_fp4(
+    const int& num_ranks, const int& num_experts,
+    const int& hidden, const int& intermediate_hidden, const int& num_topk,
+    const float& expected_tokens_per_expert, const bool& use_situ) {
+    const int enabled =
+        deep_jit::get_env<int>("DG_SM90_FP4_I2304_SPLIT_N", 1);
+    DG_HOST_ASSERT(enabled == 0 or enabled == 1);
+    return enabled != 0 and
+           not use_situ and num_ranks == 8 and num_experts == 384 and
+           hidden == 5120 and intermediate_hidden == 2304 and num_topk == 6 and
+           expected_tokens_per_expert >= 0.375f;
+}
+
+// With eight decode helpers, split-N consumers can wait independently for
+// their own 64 decoded rows and prefetch each helper thread's two scale words.
+// Keep the predicate shared by JIT emission and shared-memory accounting.
+static bool use_sm90_fp4_split_decode_pipeline(
+    const int& block_m, const int& block_n,
+    const int& num_epilogue_warpgroups, const int& num_non_epilogue_warps,
+    const bool& use_swap_ab, const bool& use_decode_done_mbarrier) {
+    const int enabled =
+        deep_jit::get_env<int>("DG_MEGA_MOE_FP4_PIPELINE_OPTIMIZED", 1);
+    DG_HOST_ASSERT(enabled == 0 or enabled == 1);
+    return enabled != 0 and block_m == 64 and block_n == 128 and
+           num_epilogue_warpgroups == 2 and num_non_epilogue_warps == 10 and
+           use_swap_ab and use_decode_done_mbarrier;
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
@@ -315,6 +337,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const int& num_non_epilogue_warps,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
     const bool& use_swap_ab = false) {
@@ -369,8 +392,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
 
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_decode_full_per_stage = use_early_b_decode ? 8 : 0;
+    const int decode_ready_groups = use_sm90_fp4_split_decode_pipeline(
+        block_m, block_n, num_epilogue_warpgroups, num_non_epilogue_warps,
+        use_swap_ab, use_decode_done_mbarrier) ? 2 : 1;
     const int smem_decode_done_per_stage =
-        use_decode_done_mbarrier ? 8 : 0;
+        use_decode_done_mbarrier ? 8 * decode_ready_groups : 0;
     const int smem_barriers_per_stage =
         2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage;
     const int smem_fixed =
@@ -405,8 +431,9 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
     const bool fp4_i2304_split_n_shape =
-        should_enable_i2304_split_n_for_mega_moe_sm90_fp4(
-            intermediate_hidden);
+        should_enable_v41_flash_split_n_for_mega_moe_sm90_fp4(
+            num_ranks, num_experts, hidden, intermediate_hidden, num_topk,
+            expected_tokens_per_expert, use_situ);
     const bool fp4_split_n_shape =
         fp4_flash_shape or fp4_pro_shape or fp4_i2304_split_n_shape;
     // Shape bands depend only on model shape and routing density; kernel bands add tile/thread constraints.
@@ -466,6 +493,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
+        num_non_epilogue_threads / 32,
         use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab);
 

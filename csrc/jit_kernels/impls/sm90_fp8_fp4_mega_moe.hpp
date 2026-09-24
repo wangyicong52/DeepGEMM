@@ -93,8 +93,26 @@ public:
 
     static std::string generate(const Args& args) {
         std::string source_prefix;
-        if (deep_jit::get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
-            source_prefix = "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+        const int paired_prmt =
+            deep_jit::get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 1);
+        DG_HOST_ASSERT(paired_prmt == 0 or paired_prmt == 1);
+        if (paired_prmt != 0)
+            source_prefix += "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+
+        if (use_sm90_fp4_split_decode_pipeline(
+                args.config.block_m, args.config.block_n,
+                args.config.num_epilogue_threads / 128,
+                args.config.num_non_epilogue_threads / 32,
+                args.use_swap_ab, args.use_decode_done_mbarrier)) {
+            source_prefix += "#define DG_MEGA_MOE_FP4_N64_DECODE_READY 1\n";
+            source_prefix += "#define DG_MEGA_MOE_FP4_SFB_LOOKAHEAD 1\n";
+            const int packed_prefetch =
+                deep_jit::get_env<int>("DG_MEGA_MOE_FP4_PACKED_PREFETCH", 1);
+            DG_HOST_ASSERT(packed_prefetch == 0 or packed_prefetch == 1);
+            if (packed_prefetch != 0 and
+                args.hidden >= 2048 and args.intermediate_hidden >= 2048)
+                source_prefix += "#define DG_MEGA_MOE_FP4_PACKED_PREFETCH 1\n";
+        }
         return std::format(R"(
 {}
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
