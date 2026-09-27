@@ -14,6 +14,7 @@
 #include <deep_jit/utils/env.hpp>
 
 #include "../heuristics/sm90.hpp"
+#include "float_literal.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/exception.hpp"
 
@@ -74,7 +75,7 @@ static std::string to_string(const at::ScalarType& dtype, const bool& fp4_unpack
 
 static std::string to_string(const float& v) {
     if (std::isfinite(v)) {
-        return std::format("{}{:a}f", std::signbit(v) ? "-" : "", std::abs(v));
+        return detail::to_cuda_hex_float_literal(v);
     } else if (std::isinf(v)) {
         return v > 0 ? "cute::numeric_limits<float>::infinity()"
                      : "-cute::numeric_limits<float>::infinity()";
