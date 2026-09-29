@@ -108,6 +108,13 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
+SM90 FP4 keeps the SS backend by default. Set `DG_SM90_FP4_USE_RS=1` before
+Python import to opt into the RS backend and its matching weight packer. SS and
+RS packed weights are incompatible: restart and repack from the raw checkpoint
+when switching. Explicit `_ss` / `_rs` APIs are available for comparisons.
+See [SM90 FP4 port and validation notes](docs/sm90-fp4-upstream-port.md) for
+constraints and CPU / GPU regression commands.
+
 Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), a gated activation, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
 
 ```python

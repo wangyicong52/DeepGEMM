@@ -1,3 +1,4 @@
+import os
 import torch
 import types
 import warnings
@@ -38,7 +39,10 @@ class SymmBuffer:
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
                  use_fp8_dispatch: bool = True):
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        if _is_sm90():
+            _validate_activation(activation)
+        else:
+            assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -268,7 +272,26 @@ def transform_weights_for_mega_moe_sm90_fp4(
 
 
 
-def fp8_fp4_mega_moe(y: torch.Tensor,
+# Resolve once, without querying CUDA at import time. Both the packer and
+# execution wrapper use this immutable choice; later environment changes cannot
+# reinterpret weights already packed for another backend.
+_fp4_use_rs = os.environ.get('DG_SM90_FP4_USE_RS', '0')
+if _fp4_use_rs not in ('0', '1'):
+    raise ValueError('DG_SM90_FP4_USE_RS must be 0 or 1')
+_SM90_FP4_USE_RS = _fp4_use_rs == '1'
+
+
+def _validate_sm90_fp4_call(sym_buffer, activation, activation_clamp,
+                             shared_l1_weights, shared_l2_weights):
+    if shared_l1_weights is not None or shared_l2_weights is not None:
+        raise ValueError('SM90 FP8xFP4 MegaMoE does not support shared expert weights')
+    if getattr(sym_buffer, 'activation_group_sizes', (128, 64)) != (128, 64):
+        raise ValueError('SM90 FP4 MegaMoE requires activation groups (128, 64)')
+    if activation == 'situ' and activation_clamp is not None:
+        raise ValueError('activation_clamp is not supported with SiTU')
+
+
+def fp8_fp4_mega_moe_ss(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
                      sym_buffer: SymmBuffer,
@@ -284,6 +307,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      num_sms: int = 0):
     _validate_activation(activation)
     if _is_sm90():
+        _validate_sm90_fp4_call(sym_buffer, activation, activation_clamp,
+                               shared_l1_weights, shared_l2_weights)
         _C.fp8_fp4_mega_moe_sm90(
             y,
             l1_weights, l2_weights,
@@ -315,6 +340,94 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math,
         activation_alpha, activation_beta
     )
+
+
+def fp8_fp4_mega_moe_rs(y: torch.Tensor,
+                        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                        sym_buffer: SymmBuffer,
+                        shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                        shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                        recipe: Tuple[int, int, int] = (1, 1, 32),
+                        activation: str = 'swiglu',
+                        activation_clamp: Optional[float] = None,
+                        fast_math: bool = True,
+                        activation_alpha: float = 1.0,
+                        activation_beta: float = 0.0,
+                        num_sms: int = 0):
+    """SM90-only RS kernel; weights must use the matching ``_fp4_rs`` packer.
+
+    Shares the SS activation buffer (groups 128/64), but not its packed weights.
+    ``activation_alpha`` and ``activation_beta`` retain the existing SM90 SiTU
+    parameter convention; both must be positive when using SiTU.
+    """
+    if not _is_sm90():
+        raise ValueError('RS FP4 MegaMoE is only supported on SM90')
+    _validate_activation(activation)
+    _validate_sm90_fp4_call(sym_buffer, activation, activation_clamp,
+                           shared_l1_weights, shared_l2_weights)
+    _C.fp8_fp4_mega_moe_sm90_rs(
+        y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe, activation, activation_clamp, activation_alpha, activation_beta,
+        fast_math, num_sms,
+    )
+
+
+# Explicit SS entries never follow the environment selector.
+transform_weights_for_mega_moe_sm90_fp4_ss = transform_weights_for_mega_moe_sm90_fp4
+
+
+def transform_weights_for_mega_moe_sm90_fp4_rs(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Losslessly pack raw checkpoint bytes/signs for the SM90 RS kernel.
+
+    Do not pass already SS- or RS-packed weights. Scales keep the SS UE8M0 layout.
+    """
+    def _pack_rs(q: torch.Tensor) -> torch.Tensor:
+        perm = torch.tensor(
+            [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15],
+            device=q.device,
+        )
+        packed = q.reshape(*q.shape[:-1], -1, 16).index_select(-1, perm)
+        words = packed.reshape_as(q).contiguous().view(torch.int32)
+        result = words & 0x77777777
+        for old, new in enumerate((0, 2, 4, 6, 1, 3, 5, 7)):
+            result |= ((words >> (old * 4)) & 8) << (new * 4)
+        return result.view(torch.int8).reshape_as(q)
+
+    l1, l2 = transform_weights_for_mega_moe_sm90_fp4_ss(l1_weights, l2_weights)
+    return (_pack_rs(l1[0]), l1[1]), (_pack_rs(l2[0]), l2[1])
+
+
+if _SM90_FP4_USE_RS:
+    transform_weights_for_mega_moe_sm90_fp4 = transform_weights_for_mega_moe_sm90_fp4_rs
+
+
+def fp8_fp4_mega_moe(y: torch.Tensor,
+                     l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                     l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                     sym_buffer: SymmBuffer,
+                     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                     recipe: Tuple[int, int, int] = (1, 1, 32),
+                     activation: str = 'swiglu',
+                     activation_clamp: Optional[float] = None,
+                     fast_math: bool = True,
+                     activation_alpha: float = 1.0,
+                     activation_beta: float = 0.0,
+                     num_sms: int = 0):
+    """Use the import-time SM90 FP4 backend; other architectures are unchanged."""
+    op = fp8_fp4_mega_moe_rs if _SM90_FP4_USE_RS and _is_sm90() else fp8_fp4_mega_moe_ss
+    return op(y, l1_weights, l2_weights, sym_buffer, shared_l1_weights,
+              shared_l2_weights, cumulative_local_expert_recv_stats, recipe,
+              activation, activation_clamp, fast_math, activation_alpha,
+              activation_beta, num_sms)
 
 
 def fp8_mega_moe(y: torch.Tensor,

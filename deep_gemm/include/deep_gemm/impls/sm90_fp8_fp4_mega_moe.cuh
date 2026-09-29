@@ -583,6 +583,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // TMA store after both WGs reduce amax, matching the 64-column SF block.
     constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
     constexpr bool kSplitNCombinesL1Store = kSplitNSharesSF;
+    // Reuse the existing 12-byte metadata allocation as a contiguous 8-byte
+    // pointer table for normal L2. Dispatch and scatter use the same layout;
+    // swapAB retains TokenSrcMetadata and the workspace size is unchanged.
+    constexpr bool kPrecomputedScatterPtr = not kSwapABL2Active;
+    DG_STATIC_ASSERT(kNumMaxTokensPerRank % 2 == 0, "Pointer table alignment");
+    const auto precomputed_scatter_ptrs = reinterpret_cast<uint64_t*>(workspace.get_token_src_metadata_ptr());
     DG_STATIC_ASSERT(not kSplitNSharesSF or kSplitNWarpgroups,
                      "share-SF only meaningful under split-N");
     DG_STATIC_ASSERT(not kSplitNSharesSF or (kWarpgroupSplitN == 2),
@@ -1173,8 +1179,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
                     pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
 
+                if constexpr (kPrecomputedScatterPtr) {
+                    const auto dst = combine_token_buffer.get_rank_buffer(src_topk_idx).get_data_buffer(src_token_idx);
+                    precomputed_scatter_ptrs[pool_token_idx] = reinterpret_cast<uint64_t>(
+                        sym_buffer.map(dst.get_base_ptr(), current_rank_in_expert_idx));
+                } else {
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                }
 
                 cute::tma_store_arrive();
                 ptx::tma_store_wait<0>();
@@ -1858,6 +1870,28 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             // of on every K-stage inside the loop.
             if constexpr (kSwapABL1Active) {
                 const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
+#if defined(DG_MEGA_MOE_FP4_FINE_TOKEN_BUCKETS)
+                // Avoid padded token columns without changing accumulation order.
+                if (block_phase == sched::BlockPhase::Linear1) {
+                    if (n_swap <= 8) run_k_stages.template operator()<true, 8>();
+                    else if (n_swap <= 16) run_k_stages.template operator()<true, 16>();
+                    else if (n_swap <= 24) run_k_stages.template operator()<true, 24>();
+                    else if (n_swap <= 32) run_k_stages.template operator()<true, 32>();
+                    else if (n_swap <= 40) run_k_stages.template operator()<true, 40>();
+                    else if (n_swap <= 48) run_k_stages.template operator()<true, 48>();
+                    else if (n_swap <= 56) run_k_stages.template operator()<true, 56>();
+                    else run_k_stages.template operator()<true, 64>();
+                } else {
+                    if (n_swap <= 8) run_k_stages.template operator()<false, 8>();
+                    else if (n_swap <= 16) run_k_stages.template operator()<false, 16>();
+                    else if (n_swap <= 24) run_k_stages.template operator()<false, 24>();
+                    else if (n_swap <= 32) run_k_stages.template operator()<false, 32>();
+                    else if (n_swap <= 40) run_k_stages.template operator()<false, 40>();
+                    else if (n_swap <= 48) run_k_stages.template operator()<false, 48>();
+                    else if (n_swap <= 56) run_k_stages.template operator()<false, 56>();
+                    else run_k_stages.template operator()<false, 64>();
+                }
+#else
                 if (block_phase == sched::BlockPhase::Linear1) {
                     if constexpr (kSwapABFlashN24Dispatch) {
                         if (n_swap <= 8) run_k_stages.template operator()<true, 8>();
@@ -1883,6 +1917,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         else run_k_stages.template operator()<false, 64>();
                     }
                 }
+#endif
             } else {
                 if (block_phase == sched::BlockPhase::Linear1)
                     run_k_stages.template operator()<true, 0>();
@@ -1930,7 +1965,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         up = cute::min(cute::max(up, -kActivationClamp),
                                        kActivationClamp);
                     }
-                    const float e = kFastMath ? __expf(-gate) : expf(-gate);
+                    float e;
+                    if constexpr (kFastMath and kActivationClamp <= 80.0f) {
+                        const float exponent = __fmul_rn(gate, -1.4426950408889634f);
+                        asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(exponent));
+                    } else {
+                        e = kFastMath ? __expf(-gate) : expf(-gate);
+                    }
                     const float sigmoid = kFastMath
                         ? math::fast_rcp(1.0f + e)
                         : 1.0f / (1.0f + e);
@@ -2041,6 +2082,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // For each pair we produce 4 post-SwiGLU floats per thread, mapped to
                 // output cols (p*8 + col_idx*2 + {0,1}) for both r0 and r1.
 
+                // SiTU has three tanh evaluations: skip padded rows to avoid
+                // extra activation work in partially filled expert tiles.
                 constexpr uint32_t kNumPairs = kAccumPerThread / 8;
                 constexpr uint32_t kNumOutputSFPerWG =
                     kSplitNSharesSF ? 1 : WG_L1_OUT_BLOCK_N / kL2ActsSFGranK;
@@ -2060,29 +2103,31 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t sf_group = kSplitNSharesSF
                         ? 0 : (p * 8) / kL2ActsSFGranK;
 
-                    if (valid_r0) {
+                    if (not kUseSiTU or valid_r0) {
                         activated_r0[p][0] = gated_activation(
                             final_accum[gate*4 + 0], final_accum[up*4 + 0]);
                         activated_r0[p][1] = gated_activation(
                             final_accum[gate*4 + 1], final_accum[up*4 + 1]);
-                        amax_r0[sf_group] = cute::max(
+                        amax_r0[sf_group] = fmaxf(
                             amax_r0[sf_group],
-                            cute::max(cute::abs(activated_r0[p][0]),
-                                      cute::abs(activated_r0[p][1])));
-                    } else {
+                            fmaxf(fabsf(activated_r0[p][0]),
+                                      fabsf(activated_r0[p][1])));
+                    }
+                    else {
                         activated_r0[p][0] = 0.0f;
                         activated_r0[p][1] = 0.0f;
                     }
-                    if (valid_r1) {
+                    if (not kUseSiTU or valid_r1) {
                         activated_r1[p][0] = gated_activation(
                             final_accum[gate*4 + 2], final_accum[up*4 + 2]);
                         activated_r1[p][1] = gated_activation(
                             final_accum[gate*4 + 3], final_accum[up*4 + 3]);
-                        amax_r1[sf_group] = cute::max(
+                        amax_r1[sf_group] = fmaxf(
                             amax_r1[sf_group],
-                            cute::max(cute::abs(activated_r1[p][0]),
-                                      cute::abs(activated_r1[p][1])));
-                    } else {
+                            fmaxf(fabsf(activated_r1[p][0]),
+                                      fabsf(activated_r1[p][1])));
+                    }
+                    else {
                         activated_r1[p][0] = 0.0f;
                         activated_r1[p][1] = 0.0f;
                     }
@@ -2097,13 +2142,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll
                 for (uint32_t sf_group = 0;
                      sf_group < kNumOutputSFPerWG; ++ sf_group) {
-                    amax_r0[sf_group] *= cute::abs(weight_r0);
-                    amax_r1[sf_group] *= cute::abs(weight_r1);
+                    amax_r0[sf_group] *= fabsf(weight_r0);
+                    amax_r1[sf_group] *= fabsf(weight_r1);
                     amax_r0[sf_group] = math::warp_reduce<4, false>(
                         amax_r0[sf_group], math::ReduceMax<float>());
                     amax_r1[sf_group] = math::warp_reduce<4, false>(
                         amax_r1[sf_group], math::ReduceMax<float>());
                 }
+
 
                 // Shared-SF split-N reduction: both N-half WGs publish their
                 // per-row amax, synchronize once, then read both values and
@@ -2295,128 +2341,202 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
-                constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
-
-                if constexpr (kSwapABL2Active) {
-                    auto store_bf16 = [&](const uint32_t& token, const uint32_t& col, float value) {
-                        smem_cd_l2[smem_cd_l2_wg_offset + token * BLOCK_N + col] =
-                            __float2bfloat16_rn(value);
-                    };
-
-                    auto store_l2_swap_chunk = [&](const uint32_t& i) {
-                        const uint32_t token_0 = i * 8 + col_idx * 2;
-                        const uint32_t token_1 = token_0 + 1;
-                        if (token_0 < valid_m) {
-                            store_bf16(token_0, r_0, final_accum[i * 4 + 0]);
-                            store_bf16(token_0, r_1, final_accum[i * 4 + 2]);
-                        }
-                        if (token_1 < valid_m) {
-                            store_bf16(token_1, r_0, final_accum[i * 4 + 1]);
-                            store_bf16(token_1, r_1, final_accum[i * 4 + 3]);
-                        }
-                    };
-
-                    const uint32_t num_swap_token_chunks = (valid_m + 7u) / 8u;
-                    store_l2_swap_chunk(0);
-                    if (valid_m > 8) {
-                        #pragma unroll
-                        for (uint32_t i = 1; i < kSwapABTokenChunks; ++ i) {
-                            if (i < num_swap_token_chunks)
-                                store_l2_swap_chunk(i);
+                if constexpr (!kSwapABL2Active && BLOCK_M == 128 && WG_BLOCK_M == 64 && WG_BLOCK_N == 128) {
+                    const uint32_t tid = warp_idx_in_wg * 32 + lane_idx;
+                    auto scratch = reinterpret_cast<uint8_t *>(smem_cd_l2 + smem_cd_l2_wg_offset);
+                    const uint32_t store_base = ((tid << 4) & 1920u) | ((tid << 3) & 16u) | ((tid & 1u) ? 8256u : 0u) |
+                                                ((tid & 4u) ? 4128u : 0u);
+#pragma unroll
+                    for (uint32_t g = 0; g < 4; ++g) {
+#pragma unroll
+                        for (uint32_t h = 0; h < 2; ++h) {
+                            const uint32_t i = g * 4 + h * 16;
+                            const uint4 packed =
+                                make_uint4(math::cast_into_bf16_and_pack(final_accum[i], final_accum[i + 1]),
+                                           math::cast_into_bf16_and_pack(final_accum[i + 2], final_accum[i + 3]),
+                                           math::cast_into_bf16_and_pack(final_accum[i + 32], final_accum[i + 33]),
+                                           math::cast_into_bf16_and_pack(final_accum[i + 34], final_accum[i + 35]));
+                            const uint32_t addr = static_cast<uint32_t>(
+                                __cvta_generic_to_shared(scratch + (store_base ^ (g * 32u)) + h * 2048u));
+                            asm volatile("st.volatile.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(addr), "r"(packed.x),
+                                         "r"(packed.y), "r"(packed.z), "r"(packed.w)
+                                         : "memory");
                         }
                     }
-                } else if constexpr (not kSwapABL2Active) {
-                    // STSM into smem_cd_l2 (BF16). Reuse SM100 column-swizzle layout.
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
-                        // Each i consumes 8 floats (one 16x256b chunk in SM100 terms).
-                        // For SM90 WGMMA layout, 8 floats per i correspond to 2 chunks of 4 floats:
-                        //   final_accum[i*8 + (0..3)] = chunk 2i: (r0c0, r0c1, r1c0, r1c1)
-                        //   final_accum[i*8 + (4..7)] = chunk 2i+1: same shape
-                        const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
 
-                        // Write to SMEM at appropriate position
-                        // Row r_0 cols [chunk_lo*8 + col_idx*2, chunk_lo*8 + col_idx*2 + 1] = r0_lo
-                        // Row r_0 cols [chunk_hi*8 + col_idx*2, chunk_hi*8 + col_idx*2 + 1] = r0_hi
-                        // Row r_1 cols [chunk_lo*8 + col_idx*2, chunk_lo*8 + col_idx*2 + 1] = r1_lo
-                        // Row r_1 cols [chunk_hi*8 + col_idx*2, chunk_hi*8 + col_idx*2 + 1] = r1_hi
-                        auto write_pair = [&](uint32_t row, uint32_t col, uint32_t packed) {
-                            auto smem_ptr = smem_cd_l2
-                                + smem_cd_l2_wg_offset
-                                + row * WG_SMEM_CD_L2_STRIDE_N
-                                + col;
-                            // BF16 STS: 2 bf16 elements
-                            *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
-                        };
-                        if (valid_r0) {
-                            const uint32_t r0_lo = math::cast_into_bf16_and_pack(
-                                final_accum[chunk_lo*4 + 0], final_accum[chunk_lo*4 + 1]);
-                            const uint32_t r0_hi = math::cast_into_bf16_and_pack(
-                                final_accum[chunk_hi*4 + 0], final_accum[chunk_hi*4 + 1]);
-                            write_pair(r_0, chunk_lo * 8 + col_idx * 2, r0_lo);
-                            write_pair(r_0, chunk_hi * 8 + col_idx * 2, r0_hi);
-                        }
-                        if (valid_r1) {
-                            const uint32_t r1_lo = math::cast_into_bf16_and_pack(
-                                final_accum[chunk_lo*4 + 2], final_accum[chunk_lo*4 + 3]);
-                            const uint32_t r1_hi = math::cast_into_bf16_and_pack(
-                                final_accum[chunk_hi*4 + 2], final_accum[chunk_hi*4 + 3]);
-                            write_pair(r_1, chunk_lo * 8 + col_idx * 2, r1_lo);
-                            write_pair(r_1, chunk_hi * 8 + col_idx * 2, r1_hi);
-                        }
-                    }
-                }
-
-                {
+                    // Reader ownership spans all four warps in this partition.
                     sync_epilogue(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Scatter to remote ranks via NVLink (one row per warp-pair)
-                    // Each warpgroup-warp covers 8 unique rows x 2 (r_0 + r_1 doubled by warps)
-                    // Lane group of 16 within a warp maps to one row.
-                    const uint32_t row_in_warp_block = lane_idx / 16;  // 0 or 1
-                    const uint32_t lane_in_row = lane_idx % 16;
-                    // In split-N each WG owns WG_BLOCK_N (= BLOCK_N/num_wg)
-                    // columns of every row; in split-M each WG owns the full
-                    // BLOCK_N columns of its WG_BLOCK_M rows. Either way the
-                    // per-WG column footprint is WG_BLOCK_N.
-                    constexpr uint32_t kColsPerScatterLane = WG_BLOCK_N / 16;
-                    static_assert(WG_BLOCK_N % 16 == 0, "Scatter layout expects an even lane partition");
-                    static_assert(kColsPerScatterLane == 4 or kColsPerScatterLane == 8,
-                                  "L2 scatter currently supports WG_BLOCK_N=64 or 128");
+                    const uint32_t load_base =
+                        ((((tid << 4) & 112u) | ((tid << 2) & 384u)) ^ ((tid & 16u) ? 4128u : 0u)) |
+                        ((tid << 8) & 2048u);
+                    const uint32_t row_start = (tid >> 4) & 7u;
+                    const uint32_t col_start = (tid << 2) & 60u;
+                    auto make_scatter_ptr = [&](uint32_t row) -> uint2 * {
+                        const uint32_t token_row = wg_m_offset + row;
+                        if (token_row >= valid_m)
+                            return nullptr;
+                        // Ordinary coherent load: dispatch writes this
+                        // table during the same kernel invocation.
+                        const uint64_t base = precomputed_scatter_ptrs[m_idx + token_row];
+                        return reinterpret_cast<uint2 *>(base +
+                                                         (n_idx + wg_n_offset + col_start) * sizeof(nv_bfloat16));
+                    };
+                    auto store_scatter_ptr = [&](uint2 *remote, uint2 low, uint2 high, bool valid) {
+                        if (valid) {
+                            const uint64_t addr = __cvta_generic_to_global(remote);
+                            asm volatile("st.global.v2.b32 [%0], {%1, %2};\n"
+                                         "st.global.v2.b32 [%0+128], {%3, %4};" ::"l"(addr),
+                                         "r"(low.x), "r"(low.y), "r"(high.x), "r"(high.y)
+                                         : "memory");
+                        }
+                    };
+#pragma unroll
+                    for (uint32_t g = 0; g < 4; ++g) {
+                        // Bound the live set to two row addresses, rather than
+                        // retaining eight pointers throughout the epilogue.
+                        auto ptr0 = make_scatter_ptr(row_start + g * 16u);
+                        auto ptr1 = make_scatter_ptr(row_start + g * 16u + 8u);
+                        uint4 a, b;
+                        const uint32_t addr0 =
+                            static_cast<uint32_t>(__cvta_generic_to_shared(scratch + load_base + g * 512u));
+                        const uint32_t addr1 =
+                            static_cast<uint32_t>(__cvta_generic_to_shared(scratch + (load_base ^ 8256u) + g * 512u));
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                     : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w)
+                                     : "r"(addr0)
+                                     : "memory");
+                        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                     : "=r"(b.x), "=r"(b.y), "=r"(b.z), "=r"(b.w)
+                                     : "r"(addr1)
+                                     : "memory");
+                        store_scatter_ptr(ptr0, make_uint2(a.x, b.x), make_uint2(a.z, b.z),
+                                          wg_m_offset + row_start + g * 16u < valid_m);
+                        store_scatter_ptr(ptr1, make_uint2(a.y, b.y), make_uint2(a.w, b.w),
+                                          wg_m_offset + row_start + g * 16u + 8u < valid_m);
+                    }
+                } else {
+                    constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
-                        const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
-                        const uint32_t m_idx_in_block = wg_m_offset + row_in_wg;
-                        if (m_idx_in_block >= valid_m) break;
+                    if constexpr (kSwapABL2Active) {
+                        auto store_bf16 = [&](const uint32_t& token, const uint32_t& col, float value) {
+                            smem_cd_l2[smem_cd_l2_wg_offset + token * BLOCK_N + col] =
+                                __float2bfloat16_rn(value);
+                        };
 
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                        const uint32_t dst_token_idx = src_metadata.token_idx;
-                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                        auto store_l2_swap_chunk = [&](const uint32_t& i) {
+                            const uint32_t token_0 = i * 8 + col_idx * 2;
+                            const uint32_t token_1 = token_0 + 1;
+                            if (token_0 < valid_m) {
+                                store_bf16(token_0, r_0, final_accum[i * 4 + 0]);
+                                store_bf16(token_0, r_1, final_accum[i * 4 + 2]);
+                            }
+                            if (token_1 < valid_m) {
+                                store_bf16(token_1, r_0, final_accum[i * 4 + 1]);
+                                store_bf16(token_1, r_1, final_accum[i * 4 + 3]);
+                            }
+                        };
 
-                        // WG_BLOCK_N=128 scatters 8 BF16s/lane (=16B, uint4).
-                        // For WG_BLOCK_N=64 each lane owns 4 BF16s (=8B), so
-                        // use uint2; a uint4 load would be misaligned for
-                        // odd lanes.
-                        auto smem_ptr = smem_cd_l2
-                            + smem_cd_l2_wg_offset
-                            + row_in_wg * WG_SMEM_CD_L2_STRIDE_N
-                            + lane_in_row * kColsPerScatterLane;
-                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
-                        if constexpr (kColsPerScatterLane == 8) {
-                            const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
-                            auto dst_ptr = math::advance_ptr<uint4>(
-                                dst_token.get_base_ptr(),
-                                (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
-                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
-                        } else {
-                            const auto packed = *reinterpret_cast<uint2*>(smem_ptr);
-                            auto dst_ptr = math::advance_ptr<uint2>(
-                                dst_token.get_base_ptr(),
-                                (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint2));
-                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        const uint32_t num_swap_token_chunks = (valid_m + 7u) / 8u;
+                        store_l2_swap_chunk(0);
+                        if (valid_m > 8) {
+                            #pragma unroll
+                            for (uint32_t i = 1; i < kSwapABTokenChunks; ++ i) {
+                                if (i < num_swap_token_chunks)
+                                    store_l2_swap_chunk(i);
+                            }
+                        }
+                    } else if constexpr (not kSwapABL2Active) {
+                        // STSM into smem_cd_l2 (BF16). Reuse SM100 column-swizzle layout.
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
+                            // Each i consumes 8 floats (one 16x256b chunk in SM100 terms).
+                            // For SM90 WGMMA layout, 8 floats per i correspond to 2 chunks of 4 floats:
+                            //   final_accum[i*8 + (0..3)] = chunk 2i: (r0c0, r0c1, r1c0, r1c1)
+                            //   final_accum[i*8 + (4..7)] = chunk 2i+1: same shape
+                            const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
+
+                            // Write to SMEM at appropriate position
+                            // Row r_0 cols [chunk_lo*8 + col_idx*2, chunk_lo*8 + col_idx*2 + 1] = r0_lo
+                            // Row r_0 cols [chunk_hi*8 + col_idx*2, chunk_hi*8 + col_idx*2 + 1] = r0_hi
+                            // Row r_1 cols [chunk_lo*8 + col_idx*2, chunk_lo*8 + col_idx*2 + 1] = r1_lo
+                            // Row r_1 cols [chunk_hi*8 + col_idx*2, chunk_hi*8 + col_idx*2 + 1] = r1_hi
+                            auto write_pair = [&](uint32_t row, uint32_t col, uint32_t packed) {
+                                auto smem_ptr = smem_cd_l2
+                                    + smem_cd_l2_wg_offset
+                                    + row * WG_SMEM_CD_L2_STRIDE_N
+                                    + col;
+                                // BF16 STS: 2 bf16 elements
+                                *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
+                            };
+                            if (valid_r0) {
+                                const uint32_t r0_lo = math::cast_into_bf16_and_pack(
+                                    final_accum[chunk_lo*4 + 0], final_accum[chunk_lo*4 + 1]);
+                                const uint32_t r0_hi = math::cast_into_bf16_and_pack(
+                                    final_accum[chunk_hi*4 + 0], final_accum[chunk_hi*4 + 1]);
+                                write_pair(r_0, chunk_lo * 8 + col_idx * 2, r0_lo);
+                                write_pair(r_0, chunk_hi * 8 + col_idx * 2, r0_hi);
+                            }
+                            if (valid_r1) {
+                                const uint32_t r1_lo = math::cast_into_bf16_and_pack(
+                                    final_accum[chunk_lo*4 + 2], final_accum[chunk_lo*4 + 3]);
+                                const uint32_t r1_hi = math::cast_into_bf16_and_pack(
+                                    final_accum[chunk_hi*4 + 2], final_accum[chunk_hi*4 + 3]);
+                                write_pair(r_1, chunk_lo * 8 + col_idx * 2, r1_lo);
+                                write_pair(r_1, chunk_hi * 8 + col_idx * 2, r1_hi);
+                            }
+                        }
+                    }
+
+                    {
+                        sync_epilogue(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        // Scatter to remote ranks via NVLink (one row per warp-pair)
+                        // Each warpgroup-warp covers 8 unique rows x 2 (r_0 + r_1 doubled by warps)
+                        // Lane group of 16 within a warp maps to one row.
+                        const uint32_t row_in_warp_block = lane_idx / 16;  // 0 or 1
+                        const uint32_t lane_in_row = lane_idx % 16;
+                        // In split-N each WG owns WG_BLOCK_N (= BLOCK_N/num_wg)
+                        // columns of every row; in split-M each WG owns the full
+                        // BLOCK_N columns of its WG_BLOCK_M rows. Either way the
+                        // per-WG column footprint is WG_BLOCK_N.
+                        constexpr uint32_t kColsPerScatterLane = WG_BLOCK_N / 16;
+                        static_assert(WG_BLOCK_N % 16 == 0, "Scatter layout expects an even lane partition");
+                        static_assert(kColsPerScatterLane == 4 or kColsPerScatterLane == 8,
+                                      "L2 scatter currently supports WG_BLOCK_N=64 or 128");
+                        using ScatterVector = std::conditional_t<kColsPerScatterLane == 8, uint4, uint2>;
+
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
+                            const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
+                            const uint32_t m_idx_in_block = wg_m_offset + row_in_wg;
+                            if (m_idx_in_block >= valid_m) break;
+
+                            // WG_BLOCK_N=128 scatters 8 BF16s/lane (=16B, uint4).
+                            // For WG_BLOCK_N=64 each lane owns 4 BF16s (=8B), so
+                            // use uint2; a uint4 load would be misaligned for
+                            // odd lanes.
+                            auto smem_ptr = smem_cd_l2
+                                + smem_cd_l2_wg_offset
+                                + row_in_wg * WG_SMEM_CD_L2_STRIDE_N
+                                + lane_in_row * kColsPerScatterLane;
+                            if constexpr (kPrecomputedScatterPtr) {
+                                const auto remote_row_base = reinterpret_cast<uint8_t*>(
+                                    precomputed_scatter_ptrs[m_idx + m_idx_in_block]);
+                                const auto packed = *reinterpret_cast<ScatterVector*>(smem_ptr);
+                                auto row_dst = reinterpret_cast<ScatterVector*>(remote_row_base +
+                                    (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(ScatterVector));
+                                *row_dst = packed;
+                            } else {
+                                const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
+                                const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
+                                                       .get_data_buffer(src_metadata.token_idx);
+                                const auto packed = *reinterpret_cast<ScatterVector*>(smem_ptr);
+                                auto dst_ptr = math::advance_ptr<ScatterVector>(
+                                    dst_token.get_base_ptr(),
+                                    (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(ScatterVector));
+                                *sym_buffer.map(dst_ptr, src_metadata.rank_idx) = packed;
+                            }
                         }
                     }
                 }

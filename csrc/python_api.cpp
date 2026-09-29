@@ -13,6 +13,7 @@
 #include "apis/layout.hpp"
 #include "apis/mega_moe.hpp"
 #include "apis/sm90_mega.hpp"
+#include "apis/sm90_mega_rs.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
 
@@ -39,6 +40,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::layout::register_apis(m);
     deep_gemm::mega::register_apis(m);
     deep_gemm::mega::register_sm90_apis(m);
+    deep_gemm::mega::register_sm90_rs_apis(m);
     deep_gemm::mega_mhc::register_apis(m);
     deep_gemm::mega_gate::register_apis(m);
 }

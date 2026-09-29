@@ -113,6 +113,13 @@ public:
                 args.hidden >= 2048 and args.intermediate_hidden >= 2048)
                 source_prefix += "#define DG_MEGA_MOE_FP4_PACKED_PREFETCH 1\n";
         }
+        if (args.use_swap_ab and args.config.block_m == 64 and
+            args.config.block_n == 128 and args.config.num_epilogue_threads == 256 and
+            use_sm90_fp4_fine_token_buckets(
+                args.hidden, args.intermediate_hidden,
+                static_cast<float>(args.num_tokens) * args.num_ranks * args.num_topk / args.num_experts,
+                args.use_situ))
+            source_prefix += "#define DG_MEGA_MOE_FP4_FINE_TOKEN_BUCKETS 1\n";
         return std::format(R"(
 {}
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>

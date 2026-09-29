@@ -19,6 +19,7 @@
 #include "apis/layout.hpp"
 #include "apis/mega.hpp"
 #include "apis/sm90_mega.hpp"
+#include "apis/sm90_mega_rs.hpp"
 #include "utils/torch_compat.hpp"
 
 
@@ -772,6 +773,7 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
     );
 }
 
+template <bool kUseRS = false>
 void dg_fp8_fp4_mega_moe_sm90(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf,
                               Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                               int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
@@ -793,7 +795,9 @@ void dg_fp8_fp4_mega_moe_sm90(TensorView y, TensorView l1_weights, TensorView l1
     auto [recipe_a, recipe_b, recipe_c] = recipe;
     auto recipe_val = std::make_tuple(static_cast<int>(recipe_a), static_cast<int>(recipe_b), static_cast<int>(recipe_c));
 
-    mega::fp8_fp4_mega_moe_sm90(
+    const auto launch = kUseRS ? &mega::fp8_fp4_mega_moe_sm90_rs
+                               : &mega::fp8_fp4_mega_moe_sm90;
+    launch(
         convert_to_torch_tensor(y),
         std::make_pair(convert_to_torch_tensor(l1_weights), convert_to_torch_tensor(l1_weights_sf)),
         std::make_pair(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
@@ -876,7 +880,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buf
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_sm90_mega_moe, dg_get_symm_buffer_size_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_mega_moe, dg_bf16_mega_moe);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe_sm90, dg_fp8_fp4_mega_moe_sm90);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe_sm90, dg_fp8_fp4_mega_moe_sm90<false>);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe_sm90_rs, dg_fp8_fp4_mega_moe_sm90<true>);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mega_moe, dg_fp8_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch, dg_mega_moe_pre_dispatch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch_sm90, dg_mega_moe_pre_dispatch_sm90);

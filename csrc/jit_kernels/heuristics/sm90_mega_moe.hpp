@@ -267,15 +267,22 @@ static FP4SM90ConfigKind get_fp4_sm90_situ_config_kind(
                                       : FP4SM90ConfigKind::kDecode;
 }
 
-// Whether `e` should run the prefill bundle (BLOCK_M=128 + early_b_decode +
-// ss_nsplit). SiTU always uses the analytic cost model above; SwiGLU keeps its
-// measured scalar boundary.
+// Compare padded rows and per-tile decode work for dense SwiGLU. Keep BM128
+// unless BM64 clears the upstream noise margin; SiTU retains its own model.
 static bool is_fp4_sm90_prefill_band(const float& expected_tokens_per_expert,
                                      const bool& use_situ) {
     if (use_situ)
         return get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
                FP4SM90ConfigKind::kPrefill;
-    return expected_tokens_per_expert >= kSM90FP4SwiGLUPrefillThreshold;
+    if (expected_tokens_per_expert < kSM90FP4SwiGLUPrefillThreshold)
+        return false;
+    constexpr float kDecodeRowsPerTile = 4.0f;
+    constexpr float kBM64GainMargin = 0.015f;
+    const float cost64 = (64.0f + kDecodeRowsPerTile) *
+        fp4_expected_num_tiles(expected_tokens_per_expert, 64);
+    const float cost128 = (128.0f + kDecodeRowsPerTile) *
+        fp4_expected_num_tiles(expected_tokens_per_expert, 128);
+    return cost64 >= cost128 * (1.0f - kBM64GainMargin);
 }
 
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
@@ -315,6 +322,24 @@ static bool should_enable_v41_flash_split_n_for_mega_moe_sm90_fp4(
            not use_situ and num_ranks == 8 and num_experts == 384 and
            hidden == 5120 and intermediate_hidden == 2304 and num_topk == 6 and
            expected_tokens_per_expert >= 0.375f;
+}
+
+// Share the shape predicate with API feature selection. Preserve the existing
+// V4.1 diagnostic switch rather than removing it during the upstream port.
+static bool is_fp4_sm90_split_n_shape(
+    int num_ranks, int num_experts, int hidden, int intermediate_hidden,
+    int num_topk, float expected_tokens_per_expert, bool use_situ) {
+    return intermediate_hidden <= 2048 or intermediate_hidden >= 3072 or
+        should_enable_v41_flash_split_n_for_mega_moe_sm90_fp4(
+            num_ranks, num_experts, hidden, intermediate_hidden, num_topk,
+            expected_tokens_per_expert, use_situ);
+}
+
+static bool use_sm90_fp4_fine_token_buckets(
+    int hidden, int intermediate_hidden, float expected_tokens_per_expert,
+    bool use_situ) {
+    return not use_situ and hidden >= 2048 and intermediate_hidden >= 2048 and
+        expected_tokens_per_expert >= 16.0f and expected_tokens_per_expert <= 32.0f;
 }
 
 // With eight decode helpers, split-N consumers can wait independently for
@@ -443,7 +468,11 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_split_n_shape and
         expected_tokens_per_expert > 0.0f and
         not is_fp4_sm90_prefill_band(expected_tokens_per_expert, use_situ);
-    if (fp4_split_n_eligible and fp4_split_n_shape_band) {
+    const bool fp4_dense_split_n_shape_band =
+        not use_situ and expected_tokens_per_expert >= kSM90FP4SwiGLUPrefillThreshold and
+        not is_fp4_sm90_prefill_band(expected_tokens_per_expert, use_situ);
+    if (fp4_split_n_eligible and
+        (fp4_split_n_shape_band or fp4_dense_split_n_shape_band)) {
         fp4_num_epilogue_warpgroups = 2;
     }
     DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
@@ -467,8 +496,17 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
 
     const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;
+    // Fill the intermediate-size gap at ultra-low routing density with eight
+    // helpers so the existing two-consumer N64-ready pipeline can be used.
+    const bool fp4_ultra_sparse_decode_kernel_band =
+        fp4_small_block_n_kernel and fp4_num_epilogue_warpgroups == 2 and
+        not use_situ and num_ranks == 8 and use_swap_ab and use_decode_done_mbarrier and
+        hidden >= 2048 and intermediate_hidden > 2048 and intermediate_hidden < 3072 and
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f;
     const bool fp4_split_n_decode_thread_kernel_band =
-        fp4_small_block_n_kernel and fp4_split_n_shape_band;
+        fp4_small_block_n_kernel and
+        (fp4_split_n_shape_band or fp4_ultra_sparse_decode_kernel_band or
+         fp4_dense_split_n_shape_band);
     const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
         fp4_num_epilogue_threads == 256 and
