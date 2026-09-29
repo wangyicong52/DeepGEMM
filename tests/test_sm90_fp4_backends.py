@@ -89,9 +89,12 @@ def run(args):
         for n in batches:
             x = torch.randn(n, h, device='cuda', dtype=torch.bfloat16)
             # Distinct experts per token. Invalid routes cover zero-output slots.
-            topk = torch.rand(n, args.experts, device='cuda').topk(args.topk, dim=-1).indices
+            topk = torch.rand(n, args.experts, device='cuda').topk(
+                args.topk, dim=-1).indices.to(torch.int32)
             if args.routing == 'skewed':
-                topk = torch.arange(args.topk, device='cuda').expand(n, -1).clone()
+                topk = torch.arange(
+                    args.topk, device='cuda', dtype=torch.int32
+                ).expand(n, -1).clone()
             if args.routing == 'invalid':
                 topk.fill_(-1)
             else:
