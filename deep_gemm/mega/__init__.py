@@ -200,7 +200,7 @@ def transform_weights_for_mega_moe(
         # BF16: L1 interleave gate/up, L2 unchanged
         l1_transformed = _interleave_weights(l1_weights)
         l2_transformed = l2_weights
-return l1_transformed, l2_transformed
+    return l1_transformed, l2_transformed
 
 
 def transform_weights_for_mega_moe_sm90(l1_weights, l2_weights):
@@ -263,7 +263,7 @@ def mega_moe_pre_dispatch_sm90(
 
 def fp8_mega_moe(
     y, l1_weights, l2_weights, sym_buffer, cumulative_local_expert_recv_stats=None,
-    recipe=(1, 1, 128), activation='swiglu', activation_clamp=None, fast_math=True,
+    recipe=(128, 128, 128), activation='swiglu', activation_clamp=None, fast_math=True,
 ):
     return _C.fp8_mega_moe(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
