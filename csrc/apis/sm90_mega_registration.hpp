@@ -2,6 +2,7 @@
 
 #include <torch/library.h>
 #include "sm90_mega.hpp"
+#include "sm90_mega_rs.hpp"
 
 namespace deep_gemm::torch_registration::sm90 {
 
@@ -49,6 +50,22 @@ static SM90SymmBufferSlice slice_symm_buffer(
     return slice(buffer);
 }
 
+static void check_fp4_buffers(
+    const torch::Tensor& y, const torch::Tensor& l1, const torch::Tensor& l1_sf,
+    const torch::Tensor& l2, const torch::Tensor& l2_sf, const torch::Tensor& buffer,
+    const std::vector<int64_t>& pointers, int64_t rank) {
+    DG_HOST_ASSERT(y.is_cuda() and y.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(y.dim() == 2 and y.is_contiguous());
+    DG_HOST_ASSERT(l1.dim() == 3 and l2.dim() == 3);
+    DG_HOST_ASSERT(y.size(1) == l1.size(2) * 2);
+    DG_HOST_ASSERT(not pointers.empty() and rank >= 0 and rank < static_cast<int64_t>(pointers.size()));
+    DG_HOST_ASSERT(buffer.is_cuda() and buffer.is_contiguous());
+    DG_HOST_ASSERT(buffer.scalar_type() == torch::kInt8);
+    DG_HOST_ASSERT(l1.device() == y.device() and l1_sf.device() == y.device());
+    DG_HOST_ASSERT(l2.device() == y.device() and l2_sf.device() == y.device());
+    DG_HOST_ASSERT(buffer.device() == y.device());
+}
+
 static void fp8_fp4_mega_moe_sm90(
     const torch::Tensor& y, const torch::Tensor& l1, const torch::Tensor& l1_sf,
     const torch::Tensor& l2, const torch::Tensor& l2_sf,
@@ -58,16 +75,26 @@ static void fp8_fp4_mega_moe_sm90(
     const std::string& activation, const std::optional<double>& clamp,
     const std::optional<double>& alpha, const std::optional<double>& beta,
     bool fast_math, int64_t num_sms) {
-    DG_HOST_ASSERT(y.is_cuda() and y.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(y.dim() == 2 and y.is_contiguous());
-    DG_HOST_ASSERT(y.size(1) == l1.size(2) * 2);
-    DG_HOST_ASSERT(not pointers.empty() and rank >= 0 and rank < static_cast<int64_t>(pointers.size()));
-    DG_HOST_ASSERT(buffer.is_cuda() and buffer.is_contiguous());
-    DG_HOST_ASSERT(buffer.scalar_type() == torch::kInt8);
-    DG_HOST_ASSERT(l1.device() == y.device() and l1_sf.device() == y.device());
-    DG_HOST_ASSERT(l2.device() == y.device() and l2_sf.device() == y.device());
-    DG_HOST_ASSERT(buffer.device() == y.device());
+    check_fp4_buffers(y, l1, l1_sf, l2, l2_sf, buffer, pointers, rank);
     mega::fp8_fp4_mega_moe_sm90(
+        y, {l1, l1_sf}, {l2, l2_sf}, stats, buffer, pointers,
+        mega::checked_int(rank), mega::checked_int(capacity),
+        mega::checked_int(num_experts), mega::checked_int(num_topk),
+        checked_recipe(recipe), activation, clamp, alpha, beta, fast_math,
+        mega::checked_int(num_sms));
+}
+
+static void fp8_fp4_mega_moe_sm90_rs(
+    const torch::Tensor& y, const torch::Tensor& l1, const torch::Tensor& l1_sf,
+    const torch::Tensor& l2, const torch::Tensor& l2_sf,
+    const std::optional<torch::Tensor>& stats, const torch::Tensor& buffer,
+    const std::vector<int64_t>& pointers, int64_t rank, int64_t capacity,
+    int64_t num_experts, int64_t num_topk, const std::vector<int64_t>& recipe,
+    const std::string& activation, const std::optional<double>& clamp,
+    const std::optional<double>& alpha, const std::optional<double>& beta,
+    bool fast_math, int64_t num_sms) {
+    check_fp4_buffers(y, l1, l1_sf, l2, l2_sf, buffer, pointers, rank);
+    mega::fp8_fp4_mega_moe_sm90_rs(
         y, {l1, l1_sf}, {l2, l2_sf}, stats, buffer, pointers,
         mega::checked_int(rank), mega::checked_int(capacity),
         mega::checked_int(num_experts), mega::checked_int(num_topk),
@@ -107,6 +134,7 @@ TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_symm_buffer_size_for_sm90_mega_moe(int num_ranks, int num_experts, int capacity, int num_topk, int hidden, int intermediate_hidden, bool use_fp8_dispatch, str activation) -> (int, int[])");
     m.def("_slice_symm_buffer_for_sm90_mega_moe(Tensor(a) buffer, int[] geometry) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
     m.def("fp8_fp4_mega_moe_sm90(Tensor(a!) y, Tensor l1, Tensor l1_sf, Tensor l2, Tensor l2_sf, Tensor(b!)? stats, Tensor(c!) buffer, int[] pointers, int rank, int capacity, int num_experts, int num_topk, int[3] recipe, str activation, float? clamp, float? alpha, float? beta, bool fast_math, int num_sms) -> ()");
+    m.def("fp8_fp4_mega_moe_sm90_rs(Tensor(a!) y, Tensor l1, Tensor l1_sf, Tensor l2, Tensor l2_sf, Tensor(b!)? stats, Tensor(c!) buffer, int[] pointers, int rank, int capacity, int num_experts, int num_topk, int[3] recipe, str activation, float? clamp, float? alpha, float? beta, bool fast_math, int num_sms) -> ()");
     m.def("fp8_mega_moe(Tensor(a!) y, Tensor l1, Tensor l1_sf, Tensor l2, Tensor l2_sf, Tensor(b!)? stats, Tensor(c!) buffer, int[] pointers, int rank, int capacity, int num_experts, int num_topk, int[3] recipe, str activation, float? clamp, bool fast_math) -> ()");
     m.def("mega_moe_pre_dispatch_sm90(Tensor x, Tensor topk_idx, Tensor topk_weights, Tensor(a!) buf_x, Tensor(b!) buf_x_sf, Tensor(c!) buf_topk_idx, Tensor(d!) buf_topk_weights, int num_tokens, int group_size, float routed_scaling_factor) -> ()");
 }
@@ -119,6 +147,7 @@ TORCH_LIBRARY_IMPL(deep_gemm, CatchAll, m) {
 TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("_slice_symm_buffer_for_sm90_mega_moe", TORCH_FN(deep_gemm::torch_registration::sm90::slice_symm_buffer));
     m.impl("fp8_fp4_mega_moe_sm90", TORCH_FN(deep_gemm::torch_registration::sm90::fp8_fp4_mega_moe_sm90));
+    m.impl("fp8_fp4_mega_moe_sm90_rs", TORCH_FN(deep_gemm::torch_registration::sm90::fp8_fp4_mega_moe_sm90_rs));
     m.impl("fp8_mega_moe", TORCH_FN(deep_gemm::torch_registration::sm90::fp8_mega_moe));
     m.impl("mega_moe_pre_dispatch_sm90", TORCH_FN(deep_gemm::torch_registration::sm90::mega_moe_pre_dispatch_sm90));
 }

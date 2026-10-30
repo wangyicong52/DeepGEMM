@@ -681,6 +681,18 @@ def fp8_mega_moe(
     )
 
 
+def fp8_fp4_mega_moe_sm90_rs(
+    y, l1_weights, l2_weights, stats, buffer, pointers, rank, capacity,
+    num_experts, num_topk, recipe, activation, clamp, alpha, beta, fast_math,
+    num_sms=0,
+):
+    return _torch_ops.fp8_fp4_mega_moe_sm90_rs(
+        y, *l1_weights, *l2_weights, stats, buffer, pointers, rank, capacity,
+        num_experts, num_topk, list(recipe), activation, clamp, alpha, beta,
+        fast_math, num_sms,
+    )
+
+
 Runtime = torch.classes.deep_gemm.Runtime
 get_jit = _torch_ops.get_jit
 
@@ -710,7 +722,8 @@ _PUBLIC_API = [
     'fp8_fp4_mega_moe', 'bf16_mega_moe',
     'get_token_alignment_for_sm90_mega_moe',
     'get_symm_buffer_size_for_sm90_mega_moe',
-    'fp8_fp4_mega_moe_sm90', 'fp8_mega_moe', 'mega_moe_pre_dispatch_sm90',
+    'fp8_fp4_mega_moe_sm90', 'fp8_fp4_mega_moe_sm90_rs',
+    'fp8_mega_moe', 'mega_moe_pre_dispatch_sm90',
     'get_token_alignment_for_nvfp4_mega_moe',
     'get_block_m_for_nvfp4_mega_moe',
     'get_symm_buffer_size_for_nvfp4_mega_moe',

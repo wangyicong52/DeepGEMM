@@ -70,26 +70,27 @@ struct FP4SM90APIDefaults {
 
 static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const bool& use_situ) {
+    const bool& use_situ, const int& num_ranks,
+    const int& hidden, const int& intermediate_hidden) {
     // Select the decode, prefill, and swapAB features from the same routing
     // density so the generated kernel uses a coherent configuration bundle.
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    // SiTU uses the analytic cost model while SwiGLU keeps its scalar boundary;
-    // share the predicate with the block-config heuristics so the feature
-    // bundle never mixes.
+    // Share the block-config predicate so decode and math use one bundle.
     const bool prefill_band = is_fp4_sm90_prefill_band(
         expected_tokens_per_expert, use_situ);
     const bool decode_band =
         expected_tokens_per_expert > 0.0f and !prefill_band;
-    // SwiGLU uses a fixed low-density swapAB boundary. SiTU derives swapAB
-    // from the same cost comparison as its decode/prefill decision.
-    const bool swap_ab =
-        use_situ
-            ? (get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
-               FP4SM90ConfigKind::kSwapAB)
-            : (decode_band and
-               expected_tokens_per_expert < kSM90FP4SwiGLUSwapABMaxE);
+    const bool fine_token_buckets = use_sm90_fp4_fine_token_buckets(
+        hidden, intermediate_hidden, expected_tokens_per_expert, use_situ) and
+        is_fp4_sm90_split_n_shape(num_ranks, num_experts_per_rank * num_ranks,
+                                 hidden, intermediate_hidden, num_topk,
+                                 expected_tokens_per_expert, use_situ);
+    const bool swap_ab = use_situ
+        ? (get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
+           FP4SM90ConfigKind::kSwapAB)
+        : (decode_band and
+           (expected_tokens_per_expert < kSM90FP4SwiGLUSwapABMaxE or fine_token_buckets));
     return {
         /*wide_load_decode=*/ decode_band,
         /*early_b_decode=*/ prefill_band,
@@ -376,7 +377,8 @@ static void fp8_fp4_mega_moe_sm90(
     }
 
     const auto fp4_defaults = get_fp4_sm90_api_defaults(
-        num_experts_per_rank, num_tokens, num_topk, use_situ);
+        num_experts_per_rank, num_tokens, num_topk, use_situ,
+        num_ranks, hidden, intermediate_hidden);
     sm90_fp8_fp4_mega_moe(y,
                           l1_acts, l1_acts_sf,
                           l2_acts, l2_acts_sf,
