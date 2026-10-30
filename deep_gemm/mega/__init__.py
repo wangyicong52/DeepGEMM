@@ -23,6 +23,10 @@ def _validate_activation(activation: str) -> None:
         f'Activation must be one of {_SUPPORTED_ACTIVATIONS}, got `{activation}`'
 
 
+def _is_sm90() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -33,7 +37,12 @@ class SymmBuffer:
                  activation: str = 'swiglu',
                  base: Optional['SymmBuffer'] = None):
         # Align token count
-        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+        sm90 = _is_sm90()
+        alignment = (
+            _C.get_token_alignment_for_sm90_mega_moe()
+            if sm90 else _C.get_token_alignment_for_mega_moe()
+        )
+        num_max_tokens_per_rank = align(num_max_tokens_per_rank, alignment)
 
         # Init
         _validate_activation(activation)
@@ -48,13 +57,21 @@ class SymmBuffer:
         self.activation = activation
 
         # Allocate or reuse a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            mma_type, activation,
-            num_shared_experts
-        )
+        if sm90:
+            assert num_shared_experts == 0, 'SM90 uses separately computed shared experts'
+            assert mma_type in ('fp8xfp4', 'fp8xfp8'), 'SM90 requires FP8 dispatch'
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
+                group.size(), num_experts, num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden, True, activation
+            )
+        else:
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+                group.size(), num_experts,
+                num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden,
+                mma_type, activation,
+                num_shared_experts
+            )
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -76,12 +93,19 @@ class SymmBuffer:
             self.handle = base.handle
 
         # Create input buffer views
-        (self.x, self.x_sf,
-         self.topk_idx, self.topk_weights,
-         self.shared_l1_acts, self.shared_l1_acts_sf,
-         self.shared_l2_acts, self.shared_l2_acts_sf,
-         self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        if sm90:
+            (self.x, self.x_sf, self.topk_idx, self.topk_weights,
+             self.l1_acts, self.l1_acts_sf,
+             self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+            self.shared_l1_acts = self.shared_l1_acts_sf = None
+            self.shared_l2_acts = self.shared_l2_acts_sf = None
+        else:
+            (self.x, self.x_sf,
+             self.topk_idx, self.topk_weights,
+             self.shared_l1_acts, self.shared_l1_acts_sf,
+             self.shared_l2_acts, self.shared_l2_acts_sf,
+             self.l1_acts, self.l1_acts_sf,
+             self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self):
         self.handle = None
@@ -169,8 +193,52 @@ def transform_weights_for_mega_moe(
         # BF16: L1 interleave gate/up, L2 unchanged
         l1_transformed = _interleave_weights(l1_weights)
         l2_transformed = l2_weights
-    return l1_transformed, l2_transformed
+return l1_transformed, l2_transformed
 
+
+def transform_weights_for_mega_moe_sm90(l1_weights, l2_weights):
+    return (_interleave_weights(l1_weights[0]), l1_weights[1]), l2_weights
+
+
+def transform_weights_for_mega_moe_sm90_fp4(l1_weights, l2_weights):
+    def pack_scales(sf):
+        assert sf.dtype == torch.float32 and sf.dim() == 3
+        experts, rows, groups = sf.shape
+        assert groups % 4 == 0, 'FP4 K/32 scale groups must be divisible by four'
+        ue8m0 = (sf.contiguous().view(torch.int32) >> 23).bitwise_and(0xff).to(torch.uint8)
+        return ue8m0.contiguous().view(torch.int32).reshape(experts, rows, groups // 4)
+
+    l1, l1_sf = l1_weights
+    l2, l2_sf = l2_weights
+    assert l1.dtype in (torch.int8, torch.uint8) and l2.dtype in (torch.int8, torch.uint8)
+    l1 = _interleave_weights(l1.contiguous().view(torch.int8))
+    l1_sf = _interleave_weights(l1_sf)
+    return (l1, pack_scales(l1_sf)), (l2.contiguous().view(torch.int8), pack_scales(l2_sf))
+
+
+def mega_moe_pre_dispatch_sm90(
+    x, topk_idx, topk_weights, sym_buffer, num_tokens=None, group_size=128,
+    routed_scaling_factor=1.0,
+):
+    if num_tokens is None:
+        num_tokens = x.size(0)
+    return _C.mega_moe_pre_dispatch_sm90(
+        x, topk_idx, topk_weights, sym_buffer.x, sym_buffer.x_sf,
+        sym_buffer.topk_idx, sym_buffer.topk_weights,
+        num_tokens, group_size, routed_scaling_factor,
+    )
+
+
+def fp8_mega_moe(
+    y, l1_weights, l2_weights, sym_buffer, cumulative_local_expert_recv_stats=None,
+    recipe=(1, 1, 128), activation='swiglu', activation_clamp=None, fast_math=True,
+):
+    return _C.fp8_mega_moe(
+        y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts,
+        sym_buffer.num_topk, recipe, activation, activation_clamp, fast_math,
+    )
 
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
@@ -185,8 +253,23 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
-                     activation_beta: float = 0.0):
+                     activation_beta: float = 0.0,
+                     num_sms: int = 0):
     _validate_activation(activation)
+    if _is_sm90():
+        assert shared_l1_weights is None and shared_l2_weights is None, \
+            'SM90 uses separately computed shared experts'
+        assert sym_buffer.mma_type == 'fp8xfp4', 'SM90 FP4 requires FP8 dispatch'
+        assert sym_buffer.x_sf.dtype == torch.float32
+        assert sym_buffer.x_sf.shape[1] == sym_buffer.hidden // 128
+        return _C.fp8_fp4_mega_moe_sm90(
+            y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+            sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts,
+            sym_buffer.num_topk, recipe, activation, activation_clamp,
+            activation_alpha, activation_beta, fast_math, num_sms,
+        )
+    assert num_sms == 0, 'Per-call SM budgets are only supported by the SM90 backend'
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,

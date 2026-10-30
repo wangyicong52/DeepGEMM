@@ -92,7 +92,11 @@ from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
+    transform_weights_for_mega_moe_sm90,
+    transform_weights_for_mega_moe_sm90_fp4,
     fp8_fp4_mega_moe,
+    fp8_mega_moe,
+    mega_moe_pre_dispatch_sm90,
     bf16_mega_moe,
 )
 from .mega.nvfp4 import NVFP4SymmBuffer, nvfp4_mega_moe

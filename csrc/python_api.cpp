@@ -15,6 +15,7 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega_moe.hpp"
+#include "apis/sm90_mega_registration.hpp"
 #include "apis/nvfp4_mega_moe.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"

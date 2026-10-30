@@ -640,6 +640,47 @@ def get_symm_buffer_size_for_nvfp4_mega_moe(
     return num_bytes, slice_input_buffers
 
 
+get_token_alignment_for_sm90_mega_moe = _torch_ops.get_token_alignment_for_sm90_mega_moe
+mega_moe_pre_dispatch_sm90 = _torch_ops.mega_moe_pre_dispatch_sm90
+
+
+def get_symm_buffer_size_for_sm90_mega_moe(
+    num_ranks, num_experts, capacity, num_topk, hidden, intermediate_hidden,
+    use_fp8_dispatch, activation,
+):
+    num_bytes, geometry = _torch_ops.get_symm_buffer_size_for_sm90_mega_moe(
+        num_ranks, num_experts, capacity, num_topk, hidden, intermediate_hidden,
+        use_fp8_dispatch, activation,
+    )
+
+    def slice_input_buffers(buffer):
+        return _torch_ops._slice_symm_buffer_for_sm90_mega_moe(buffer, geometry)
+
+    return num_bytes, slice_input_buffers
+
+
+def fp8_fp4_mega_moe_sm90(
+    y, l1_weights, l2_weights, stats, buffer, pointers, rank, capacity,
+    num_experts, num_topk, recipe, activation, clamp, alpha, beta, fast_math,
+    num_sms=0,
+):
+    return _torch_ops.fp8_fp4_mega_moe_sm90(
+        y, *l1_weights, *l2_weights, stats, buffer, pointers, rank, capacity,
+        num_experts, num_topk, list(recipe), activation, clamp, alpha, beta,
+        fast_math, num_sms,
+    )
+
+
+def fp8_mega_moe(
+    y, l1_weights, l2_weights, stats, buffer, pointers, rank, capacity,
+    num_experts, num_topk, recipe, activation, clamp, fast_math,
+):
+    return _torch_ops.fp8_mega_moe(
+        y, *l1_weights, *l2_weights, stats, buffer, pointers, rank, capacity,
+        num_experts, num_topk, list(recipe), activation, clamp, fast_math,
+    )
+
+
 Runtime = torch.classes.deep_gemm.Runtime
 get_jit = _torch_ops.get_jit
 
@@ -667,6 +708,9 @@ _PUBLIC_API = [
     'get_block_m_for_mega_moe',
     'get_symm_buffer_size_for_mega_moe',
     'fp8_fp4_mega_moe', 'bf16_mega_moe',
+    'get_token_alignment_for_sm90_mega_moe',
+    'get_symm_buffer_size_for_sm90_mega_moe',
+    'fp8_fp4_mega_moe_sm90', 'fp8_mega_moe', 'mega_moe_pre_dispatch_sm90',
     'get_token_alignment_for_nvfp4_mega_moe',
     'get_block_m_for_nvfp4_mega_moe',
     'get_symm_buffer_size_for_nvfp4_mega_moe',
