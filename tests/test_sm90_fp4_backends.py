@@ -101,8 +101,7 @@ def run(args):
                 topk[::7, 0] = -1
             weights = torch.rand(n, args.topk, device='cuda', dtype=torch.float32)
             weights /= weights.sum(-1, keepdim=True)
-            mega_moe_pre_dispatch_sm90(x, topk, weights, buf.x, buf.x_sf,
-                                      buf.topk_idx, buf.topk_weights, n)
+            mega_moe_pre_dispatch_sm90(x, topk, weights, buf, n)
             expected = reference(buf, w1, w2, n, args.activation, args.clamp, world, rank)
             kwargs = dict(activation=args.activation,
                           activation_clamp=None if args.activation == 'situ' else args.clamp,
