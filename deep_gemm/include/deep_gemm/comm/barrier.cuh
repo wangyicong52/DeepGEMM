@@ -41,23 +41,20 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
         const auto count_ptr = workspace.template get_grid_sync_count_ptr<kGridSyncIndex>();
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+        const auto start_clock = clock64();
         uint32_t new_value;
+        while ((((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag) == 0) {
+            if (clock64() - start_clock >= kNumTimeoutCycles) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
         !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
-        do {
-            new_value = ptx::ld_acq(count_ptr);
-        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+                DG_TRAP_ONLY_DEVICE_ASSERT(false and "Grid sync timeout");
 #else
-        const auto start_clock = clock64();
-        do {
-            new_value = ptx::ld_acq(count_ptr);
-            if (clock64() - start_clock >= kNumTimeoutCycles) {
                 printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
                        sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
                 DG_DEVICE_ASSERT(false and "Grid sync timeout");
-            }
-        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
 #endif
+            }
+        }
     }
     sync_scope();
 }
