@@ -44,16 +44,19 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
         const auto start_clock = clock64();
         uint32_t new_value;
         while ((((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag) == 0) {
-            if (clock64() - start_clock >= kNumTimeoutCycles) {
+            if (clock64() - start_clock >= kNumTimeoutCycles)
+                break;
+        }
+        // Keep the trap outside the polling loop for SM90 register allocation.
+        if (((new_value ^ old_value) & kFinishSumTag) == 0) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
         !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
-                DG_TRAP_ONLY_DEVICE_ASSERT(false and "Grid sync timeout");
+            DG_TRAP_ONLY_DEVICE_ASSERT(false and "Grid sync timeout");
 #else
-                printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
-                       sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
-                DG_DEVICE_ASSERT(false and "Grid sync timeout");
+            printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
+                   sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+            DG_DEVICE_ASSERT(false and "Grid sync timeout");
 #endif
-            }
         }
     }
     sync_scope();
@@ -89,17 +92,20 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             const auto start_clock = clock64();
-            while (ptx::ld_acq_sys(signal_ptr) != target) {
-                if (clock64() - start_clock >= kNumTimeoutCycles) {
+            int signal;
+            while ((signal = ptx::ld_acq_sys(signal_ptr)) != target) {
+                if (clock64() - start_clock >= kNumTimeoutCycles)
+                    break;
+            }
+            if (signal != target) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
         !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
-                    DG_TRAP_ONLY_DEVICE_ASSERT(false);
+                DG_TRAP_ONLY_DEVICE_ASSERT(false);
 #else
-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                    DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+                printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                       sym_buffer.rank_idx, *counter_ptr, signal, target, signal_phase, signal_sign, kTag);
+                DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
 #endif
-                }
             }
         }
     }

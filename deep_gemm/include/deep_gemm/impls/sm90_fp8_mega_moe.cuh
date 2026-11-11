@@ -2220,6 +2220,9 @@ sm90_fp8_mega_moe_impl(void* y,
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        // Order all lanes' shared reads before the next TMA write.
+                        cutlass::arch::fence_view_async_shared();
+                        __syncwarp();
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
